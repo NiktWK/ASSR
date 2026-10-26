@@ -1,0 +1,15 @@
+name: Toy optimization
+mode: demo
+profile: toy
+goal: Measure the effect of increasing training iterations on validation accuracy
+seeds: [11, 22, 33]
+delta: 0.01
+baseline_expected: null
+baseline_tolerance: 0.15
+budget:
+  gpu_seconds: 7200
+  llm_usd: 5
+  walltime_seconds: 120
+  max_repairs: 3
+  max_infra_retries: 2
+  max_iterations: 3

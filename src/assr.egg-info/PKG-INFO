@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: assr
+Version: 0.1.0
+Summary: Controlled multi-agent ML research workflows
+Requires-Python: >=3.12
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: uvicorn<1,>=0.30
+Requires-Dist: sqlalchemy<3,>=2
+Requires-Dist: pydantic<3,>=2.8
+Requires-Dist: httpx<1,>=0.27
+Requires-Dist: langgraph<2,>=1
+Requires-Dist: pyyaml<7,>=6
+Requires-Dist: psycopg[binary]<4,>=3
+Provides-Extra: dev
+Requires-Dist: pytest<10,>=8; extra == "dev"
+Requires-Dist: ruff<1,>=0.11; extra == "dev"

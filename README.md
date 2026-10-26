@@ -1,3 +1,63 @@
-# ASSR
+# ASSR / САНИ
 
-Automated System for Scientific Research in machine learning.
+**Automated System for Scientific Research / Система автоматизации научных исследований (САНИ)** — управляемый цикл ML исследования: гипотеза → реализация → эксперимент → проверка → вывод.
+
+Пять логических ролей: исследователь, разработчик, исполнитель экспериментов, технический контролёр К2 и научный контролёр К1. LangGraph маршрутизирует шаги; SQL хранит долговечное состояние. Человек принимает исходный план, а runner соблюдает ограничения независимо от LLM.
+
+## Быстрый запуск
+
+Требуются Python 3.12+, Git и [uv](https://docs.astral.sh/uv/). Команды выполняются из корня репозитория.
+
+```bash
+uv sync --frozen --extra dev
+uv run assr demo
+uv run assr serve
+```
+
+Откройте **http://127.0.0.1:8000**. `demo` создаёт профиль, выполняет измеряемый CPU эксперимент с тремя seed для baseline и treatment, сохраняет отчёт в `.assr/`. Только эта явная команда автоматически принимает известный демонстрационный план. Кампания из интерфейса ждёт решения человека.
+
+Чтобы только подготовить данные и затем создать кампанию в интерфейсе:
+
+```bash
+uv run assr init-demo
+uv run assr serve
+```
+
+DEMO не вызывает LLM и не притворяется GPU экспериментом. Он исполняет только два встроенных варианта toy программы. Произвольный сгенерированный код допускается только в LIVE через контейнерный runner.
+
+## Что реализовано
+
+- Версионированные Pydantic контракты; OpenAPI по `/docs`; JSON Schema через `assr schemas`.
+- План и человеческое согласование; генерация ограниченного изменения кода; К2 до/после запусков; анализ и К1.
+- Git снимки baseline и treatment, diff, SHA и hashes кода, конфигурации, данных и evaluator.
+- PostgreSQL для развёртывания и SQLite для локальной работы; атомарные snapshots, журнал, leases, проверка revision и Idempotency-Key.
+- Ограничения LLM, GPU времени, попыток исправления и итераций; пауза, продолжение, отмена и reconciliation.
+- SSH JSON RPC runner с устойчивыми именами Docker контейнеров, no-network, read-only root, ограничениями ресурсов и отдельным trusted evaluator.
+- MLflow REST интеграция для параметров, метрик и ссылок на артефакты.
+- Web интерфейс, CLI, Markdown отчёты, Docker Compose, CI и fault-injection тесты.
+
+## Реальные модели и GPU
+
+См. [руководство развёртывания](docs/deployment.md). Нужны собственные LLM endpoint/key/model, GPU сервер с rootless Docker и NVIDIA runtime, проверенные образы по digest, профиль датасета и evaluator, квота диска и измеренный baseline. Пример PyTorch адаптера: [examples/pytorch/train.py](examples/pytorch/train.py).
+
+Рабочая область модели содержит только allowlisted исходники, обучающие данные и validation features. Метки validation доступны evaluator; test-набор в этой версии вообще не подключается. Это пилотный validation цикл, **не доказательство качества на независимом test**.
+
+## Проверка
+
+```bash
+uv run pytest -q
+uv run ruff check --select E9,F63,F7,F82 src tests
+uv run assr demo
+```
+
+Тесты проверяют реальный CPU цикл, сохранение состояния, stale approvals, повторный submit, отмену до submit, превышение бюджета, отсутствие артефактов, NaN, утечку меток, разрыв SSH и контракты Docker/MLflow/LLM. Docker поведение проверяется также через подставной движок; это не заменяет тест на реальном GPU сервере.
+
+## Документация
+
+- [Архитектура и решения](docs/architecture.md)
+- [Развёртывание и эксплуатация](docs/deployment.md)
+- [Соответствие ТЗ и границы проверки](docs/acceptance.md)
+- [Контракты и интерфейсы](docs/contracts.md)
+- [Выбор открытых компонентов](docs/adr-001-framework.md)
+
+Начальная реализация использует LangGraph и MLflow. Код RD-Agent, AIDE и AI Scientist не копировался. Установка RD-Agent на GPU и сравнительный пилот остаются отдельной экспериментальной задачей; fallback выбран явно, а не на основании вымышленного теста.
