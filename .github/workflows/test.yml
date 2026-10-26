@@ -1,0 +1,25 @@
+name: tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --frozen --extra dev
+      - run: uv run pytest -q
+      - run: uv run ruff check --select E9,F63,F7,F82 src tests
+      - run: uv run assr demo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-${{ matrix.python }}
+          path: .assr/*.md

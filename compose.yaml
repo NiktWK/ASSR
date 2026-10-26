@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: assr
+      POSTGRES_PASSWORD: ${ASSR_DB_PASSWORD:?Set ASSR_DB_PASSWORD}
+      POSTGRES_DB: assr
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U assr"]
+      interval: 5s
+      retries: 10
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.5.1
+    command: [mlflow, server, --host, 0.0.0.0, --port, '5000', --backend-store-uri, 'sqlite:////mlflow/mlflow.db', --default-artifact-root, /mlflow/artifacts, --allowed-hosts, 'mlflow:5000,localhost:5000,127.0.0.1:5000']
+    volumes:
+      - mlflow:/mlflow
+    ports:
+      - '127.0.0.1:5000:5000'
+  api:
+    build: .
+    environment:
+      ASSR_DATABASE_URL: postgresql+psycopg://assr:${ASSR_DB_PASSWORD}@postgres/assr
+      ASSR_TOKEN: ${ASSR_TOKEN:?Set ASSR_TOKEN}
+      ASSR_MLFLOW_URL: http://mlflow:5000
+      ASSR_LLM_URL: ${ASSR_LLM_URL:-}
+      ASSR_LLM_KEY: ${ASSR_LLM_KEY:-}
+      ASSR_LLM_MODEL: ${ASSR_LLM_MODEL:-}
+      ASSR_INPUT_USD_PER_MILLION: ${ASSR_INPUT_USD_PER_MILLION:-0}
+      ASSR_OUTPUT_USD_PER_MILLION: ${ASSR_OUTPUT_USD_PER_MILLION:-0}
+      ASSR_SSH_HOST: ${ASSR_SSH_HOST:-}
+    volumes:
+      - state:/state
+    ports:
+      - '127.0.0.1:8000:8000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+volumes:
+  postgres:
+  mlflow:
+  state:
