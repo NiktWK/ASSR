@@ -1,0 +1,126 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "developer-plan": {
+      "mode": "primary",
+      "description": "ASSR developer plan",
+      "prompt": "You are ASSR developer in plan. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "developer-build": {
+      "mode": "primary",
+      "description": "ASSR developer build",
+      "prompt": "You are ASSR developer in build. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow"
+      }
+    },
+    "runner-plan": {
+      "mode": "primary",
+      "description": "ASSR runner plan",
+      "prompt": "You are ASSR runner in plan. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "runner-build": {
+      "mode": "primary",
+      "description": "ASSR runner build",
+      "prompt": "You are ASSR runner in build. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "researcher-plan": {
+      "mode": "primary",
+      "description": "ASSR researcher plan",
+      "prompt": "You are ASSR researcher in plan. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "researcher-build": {
+      "mode": "primary",
+      "description": "ASSR researcher build",
+      "prompt": "You are ASSR researcher in build. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "k1-plan": {
+      "mode": "primary",
+      "description": "ASSR k1 plan",
+      "prompt": "You are ASSR k1 in plan. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "k1-build": {
+      "mode": "primary",
+      "description": "ASSR k1 build",
+      "prompt": "You are ASSR k1 in build. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "k2-plan": {
+      "mode": "primary",
+      "description": "ASSR k2 plan",
+      "prompt": "You are ASSR k2 in plan. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    },
+    "k2-build": {
+      "mode": "primary",
+      "description": "ASSR k2 build",
+      "prompt": "You are ASSR k2 in build. Follow the assigned task. Never claim execution without tool evidence. Shell and compute execution are not yet integrated. Report blockers explicitly.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    }
+  }
+}

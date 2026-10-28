@@ -1,7 +1,9 @@
 # ASSR
 
-Рабочая ветка реализации ТЗ 0.3. Пока содержит только транзакционное ядро вопросов; OpenCode и вычислительные адаптеры ещё не подключены.
+Реализация ТЗ 0.3 в процессе. Сейчас доступны долговечные вопросы, проверка допуска Plan/Build и HTTP-адаптер OpenCode с CLI. Автономный MVP ещё не готов.
 
-Проверка: `PYTHONPATH=src python -m unittest discover -s tests -v`
+Тесты: `PYTHONPATH=src python -m unittest discover -s tests -v`
 
-См. `docs/acceptance.md` и `docs/specification-v03.txt`. Никакие реальные LLM/GPU-запуски этим компонентом не выполняются.
+Ручной OpenCode-прогон: [инструкция](docs/opencode-prototype.md).
+
+[Статус приёмки](docs/acceptance.md) · [ТЗ](docs/specification-v03.txt)
