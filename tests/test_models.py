@@ -12,6 +12,7 @@ from urllib.error import URLError
 
 import team
 import team_db
+import settings
 
 
 class ModelResolutionTest(unittest.TestCase):
@@ -178,6 +179,12 @@ class SendRetryTest(unittest.TestCase):
                     raise team.OpenCodeError("ход завис")
                 return {"parts": [{"type": "text", "text": "ok"}]}
 
+            def context_usage(self, session_id):
+                return {"tokens": 0, "model": None}
+
+            def summarize(self, session_id, model, auto=False):
+                pass
+
         client = Client()
         sessions = {role: f"ses_{role}" for role in team.ROLES}
         orch = team.Orchestrator(
@@ -251,6 +258,172 @@ class RestartServerTest(unittest.TestCase):
             team.ensure_server(4096, verbose=False)
         self.assertEqual(captured["port"], 4097)
         self.assertEqual(captured["password"], "secret")
+
+
+class ContextUsageTest(unittest.TestCase):
+    def _client(self, messages):
+        client = team.OpenCode("http://x", timeout=1)
+        client.messages = lambda session_id: messages
+        return client
+
+    def test_total_and_model(self) -> None:
+        client = self._client(
+            [
+                {"info": {"role": "user"}},
+                {
+                    "info": {
+                        "role": "assistant",
+                        "providerID": "anymodel",
+                        "modelID": "glm-5.3",
+                        "tokens": {"total": 12345},
+                    }
+                },
+            ]
+        )
+        usage = client.context_usage("ses_x")
+        self.assertEqual(usage["tokens"], 12345)
+        self.assertEqual(usage["model"], {"providerID": "anymodel", "modelID": "glm-5.3"})
+
+    def test_fallback_sum_without_total(self) -> None:
+        client = self._client(
+            [
+                {
+                    "info": {
+                        "role": "assistant",
+                        "tokens": {
+                            "input": 100,
+                            "output": 20,
+                            "reasoning": 5,
+                            "cache": {"read": 1000},
+                        },
+                    }
+                }
+            ]
+        )
+        self.assertEqual(client.context_usage("ses_x")["tokens"], 1125)
+
+    def test_skips_aborted_turn_with_zero_tokens(self) -> None:
+        client = self._client(
+            [
+                {"info": {"role": "assistant", "tokens": {"total": 410492}}},
+                {
+                    "info": {
+                        "role": "assistant",
+                        "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0}},
+                        "error": {"name": "APIError"},
+                    }
+                },
+            ]
+        )
+        self.assertEqual(client.context_usage("ses_x")["tokens"], 410492)
+
+    def test_no_assistant_turn(self) -> None:
+        client = self._client([{"info": {"role": "user"}}])
+        self.assertEqual(client.context_usage("ses_x"), {"tokens": 0, "model": None})
+
+
+class SummarizeTest(unittest.TestCase):
+    def test_posts_model_and_auto(self) -> None:
+        client = team.OpenCode("http://x", timeout=1)
+        captured = {}
+
+        def fake_request(method, path, body=None, timeout=None):
+            captured.update(method=method, path=path, body=body)
+            return True
+
+        client.request = fake_request
+        client.summarize("ses_x", {"providerID": "p", "modelID": "m"})
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/session/ses_x/summarize")
+        self.assertEqual(
+            captured["body"], {"providerID": "p", "modelID": "m", "auto": False}
+        )
+
+    def test_requires_model(self) -> None:
+        client = team.OpenCode("http://x", timeout=1)
+        with self.assertRaises(team.OpenCodeError):
+            client.summarize("ses_x", None)
+
+
+class MaybeCompactTest(unittest.TestCase):
+    def _orchestrator(self, client):
+        tmp = Path(tempfile.mkdtemp(prefix="compact-"))
+        db = tmp / "state.db"
+        team_db.init(db)
+        conn = team_db.connect(db)
+        for role in team.ROLES:
+            team_db.set_session(conn, role, f"ses_{role}")
+        conn.close()
+        sessions = {role: f"ses_{role}" for role in team.ROLES}
+        orch = team.Orchestrator(
+            "t", {"url": "http://x", "password": ""}, sessions,
+            timeout=1, db_path=db, run_dir=tmp,
+        )
+        orch.client = client
+        return orch
+
+    class Client:
+        def __init__(self, tokens, fail=False):
+            self.tokens = tokens
+            self.fail = fail
+            self.summarized = []
+            self.prompts = 0
+
+        def context_usage(self, session_id):
+            return {"tokens": self.tokens, "model": {"providerID": "p", "modelID": "m"}}
+
+        def summarize(self, session_id, model, auto=False):
+            self.summarized.append((session_id, model))
+            if self.fail:
+                raise team.OpenCodeError("boom")
+
+        def prompt(self, *args, **kwargs):
+            self.prompts += 1
+            return {"parts": [{"type": "text", "text": "ok"}]}
+
+    def test_compacts_above_threshold(self) -> None:
+        client = self.Client(150)
+        orch = self._orchestrator(client)
+        try:
+            with mock.patch.object(settings, "compact_threshold", return_value=100):
+                result = orch.send("developer", "build", "msg")
+        finally:
+            orch.conn.close()
+        self.assertEqual(result, "ok")
+        self.assertEqual(client.summarized, [("ses_developer", {"providerID": "p", "modelID": "m"})])
+        self.assertEqual(client.prompts, 1)
+
+    def test_skips_below_threshold(self) -> None:
+        client = self.Client(50)
+        orch = self._orchestrator(client)
+        try:
+            with mock.patch.object(settings, "compact_threshold", return_value=100):
+                orch.send("developer", "build", "msg")
+        finally:
+            orch.conn.close()
+        self.assertEqual(client.summarized, [])
+
+    def test_disabled_threshold_skips(self) -> None:
+        client = self.Client(10_000)
+        orch = self._orchestrator(client)
+        try:
+            with mock.patch.object(settings, "compact_threshold", return_value=0):
+                orch.send("developer", "build", "msg")
+        finally:
+            orch.conn.close()
+        self.assertEqual(client.summarized, [])
+
+    def test_summarize_failure_does_not_break_send(self) -> None:
+        client = self.Client(150, fail=True)
+        orch = self._orchestrator(client)
+        try:
+            with mock.patch.object(settings, "compact_threshold", return_value=100):
+                result = orch.send("developer", "build", "msg")
+        finally:
+            orch.conn.close()
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(client.summarized), 1)
+        self.assertEqual(client.prompts, 1)
 
 
 if __name__ == "__main__":

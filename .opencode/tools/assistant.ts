@@ -14,12 +14,15 @@ type Args = {
     | "result"
     | "models"
     | "setmodel"
+    | "compact"
+    | "setcompact"
   limit?: number
   id?: string
   text?: string
   task?: string
   target?: string
   model?: string
+  tokens?: number
 }
 
 export default tool({
@@ -33,7 +36,9 @@ export default tool({
     "tell_controller (text - deliver the operator's instruction to the controller of the active run), " +
     "result (latest controller final conclusion), " +
     "models (current agent models), " +
-    "setmodel (target, model - change models on the operator's explicit request; live-checked and applied next turn / in a safe window).",
+    "setmodel (target, model - change models on the operator's explicit request; live-checked and applied next turn / in a safe window), " +
+    "compact (per-role context-compaction thresholds and current usage), " +
+    "setcompact (target, tokens - set the auto-compaction threshold; 0 disables it).",
   args: {
     action: tool.schema
       .enum([
@@ -49,6 +54,8 @@ export default tool({
         "result",
         "models",
         "setmodel",
+        "compact",
+        "setcompact",
       ])
       .describe("Directive to execute"),
     limit: tool.schema.number().optional().describe("events: how many recent events (default 20, max 100)"),
@@ -60,6 +67,10 @@ export default tool({
       .optional()
       .describe("setmodel: controller-plan … tester-build, secretary, role shorthand or all"),
     model: tool.schema.string().optional().describe("setmodel: provider/model"),
+    tokens: tool.schema
+      .number()
+      .optional()
+      .describe("setcompact: token threshold (0 disables auto-compaction)"),
   },
   async execute(args, context) {
     const session = String((context as { sessionID?: string }).sessionID ?? "")
@@ -70,11 +81,19 @@ export default tool({
     if (args.task !== undefined) cmd.push("--task", String(args.task))
     if (args.target !== undefined) cmd.push("--target", String(args.target))
     if (args.model !== undefined) cmd.push("--model", String(args.model))
-    const proc = Bun.spawnSync({ cmd, stdout: "pipe", stderr: "pipe" })
-    const out = proc.stdout.toString().trim()
-    const err = proc.stderr.toString().trim()
-    if (proc.exitCode !== 0) {
-      throw new Error(err || out || `assistant_agent.py exited with code ${proc.exitCode}`)
+    if (args.tokens !== undefined) cmd.push("--tokens", String(Math.round(args.tokens)))
+    // Async spawn: spawnSync would block the server event loop and the tool would
+    // then time out talking to that very server (health check, live sessions).
+    const proc = Bun.spawn({ cmd, stdout: "pipe", stderr: "pipe" })
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    const out = stdout.trim()
+    const err = stderr.trim()
+    if (code !== 0) {
+      throw new Error(err || out || `assistant_agent.py exited with code ${code}`)
     }
     return out || "ok"
   },

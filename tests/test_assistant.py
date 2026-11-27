@@ -13,6 +13,7 @@ from unittest import mock
 import assistant_agent
 import model_admin
 import run_control
+import settings
 import team_db
 
 
@@ -270,6 +271,63 @@ class AssistantTest(unittest.TestCase):
         rc, out, _ = self.call("result")
         self.assertEqual(rc, 0)
         self.assertIn("ИТОГОВОЕ ЗАКЛЮЧЕНИЕ", out)
+
+    def test_role_state_without_live_client(self) -> None:
+        conn = team_db.connect(self.db)
+        try:
+            self.assertIn(
+                "живые данные недоступны",
+                assistant_agent._role_state(None, conn, "developer"),
+            )
+        finally:
+            conn.close()
+
+    def test_busy_server_is_not_reported_as_stopped(self) -> None:
+        server = {"url": "http://127.0.0.1:4097", "password": "x", "pid": 4242}
+        with mock.patch.object(
+            assistant_agent.team, "load_server", return_value=server
+        ), mock.patch.object(
+            assistant_agent.team.OpenCode, "health", return_value=False
+        ), mock.patch.object(
+            assistant_agent.team, "pid_is_alive", return_value=True
+        ):
+            rc, out, _ = self.call("status")
+        self.assertEqual(rc, 0)
+        self.assertIn("сервер занят и не отвечает", out)
+        self.assertIn("pid 4242", out)
+        self.assertNotIn("сервер недоступен", out)
+
+    def test_compact_lists_thresholds(self) -> None:
+        rc, out, _ = self.call("compact")
+        self.assertEqual(rc, 0)
+        self.assertIn("controller", out)
+        self.assertIn("150k", out)
+        self.assertIn("200k", out)
+
+    def test_setcompact_updates_threshold(self) -> None:
+        settings_file = self.tmp / "settings.json"
+        with mock.patch.object(settings, "RUN_DIR", self.tmp), mock.patch.object(
+            settings, "SETTINGS_FILE", settings_file
+        ):
+            rc, out, _ = self.call(
+                "setcompact", "--target", "developer", "--tokens", "120000"
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("developer=120k", out)
+            self.assertEqual(settings.compact_threshold("developer"), 120_000)
+
+    def test_setcompact_rejects_bad_input(self) -> None:
+        settings_file = self.tmp / "settings.json"
+        with mock.patch.object(settings, "RUN_DIR", self.tmp), mock.patch.object(
+            settings, "SETTINGS_FILE", settings_file
+        ):
+            rc, _, err = self.call("setcompact", "--target", "nope", "--tokens", "100000")
+            self.assertEqual(rc, 2)
+            self.assertIn("неизвестная роль", err)
+            rc, _, err = self.call("setcompact", "--target", "developer", "--tokens", "5")
+            self.assertEqual(rc, 2)
+            self.assertIn("порог", err)
+            self.assertFalse(settings_file.exists())
 
 
 if __name__ == "__main__":

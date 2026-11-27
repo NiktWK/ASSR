@@ -117,6 +117,9 @@ python3 tg_bot.py             # запустить бота
 - `/models` — модели всех профилей: что в конфиге и что фактически было в последнем ходе.
 - `/setmodel <target> <provider/model>` — сменить модель. Цели: `controller-plan` … `tester-build`,
   `secretary`, шорткаты `controller|researcher|developer|tester` (обе фазы), `all`.
+- `/compact` — пороги авто-сжатия контекста по ролям и текущее заполнение.
+- `/compactset <role|all> <N>` — задать порог в токенах (`0` — выключить роль).
+- `/compactnow <role>` — сжать контекст роли сейчас.
 - `/ask <вопрос>` или любой обычный текст — **секретарь**.
 
 Вопросы приходят с кнопками: «✅ Принять» / «✏️ Доработать» для плана и финала,
@@ -139,13 +142,24 @@ python3 tg_bot.py             # запустить бота
 
 Неприменённые изменения переживают перезапуск бота (`run/models_pending.json`).
 
+### Авто-сжатие контекста
+
+Сессии ролей живут весь прогон, поэтому контекст растёт. Перед каждым ходом
+оркестратор сравнивает `tokens.total` последнего ответа роли с порогом из
+`run/settings.json` (`{"compact": {"controller": 150000, …}}`) и при превышении
+вызывает нативное сжатие opencode (`POST /session/{id}/summarize`). Пороги по
+умолчанию: контролёр и секретарь — 150k, исследователь/разработчик/тестировщик —
+200k; `0` отключает сжатие для роли. Настройка — командами `/compact`,
+`/compactset`, `/compactnow` (или `assistant compact`/`setcompact` у секретаря).
+Сбой сжатия не останавливает прогон — он только пишется в `run/console.log`.
+
 ## Секретарь
 
 Постоянная сессия `team/secretary` (id в `run/secretary.json`), переживает сброс
 `state.db`. Инструмент `assistant` (`.opencode/tools/assistant.ts`):
 
 `status`, `tasks`, `events`, `questions`, `question`, `answer`, `start`, `stop`,
-`tell_controller`, `result`.
+`tell_controller`, `result`, `models`, `setmodel`, `compact`, `setcompact`.
 
 Секретарь может читать весь проект, включая `run/chat/`, но не меняет файлы и не
 пишет код. По явной просьбе оператора он может менять модели агентов:

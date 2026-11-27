@@ -16,6 +16,7 @@ from pathlib import Path
 
 import model_admin
 import run_control
+import settings
 import team
 import team_db
 
@@ -60,12 +61,18 @@ def _run_status() -> tuple[str, str, str]:
         conn.close()
 
 
-def _server_client():
+def _server_state() -> tuple:
+    """(client|None, note): never confuse a busy server with a stopped one."""
     server = team.load_server()
     if not server:
-        return None
+        return None, "сервер не запущен (нет run/server.json)"
     client = team.OpenCode(server["url"], server.get("password"), timeout=20)
-    return client if client.health() else None
+    if client.health():
+        return client, "ok"
+    pid = server.get("pid")
+    if pid and team.pid_is_alive(pid):
+        return None, f"сервер занят и не отвечает (процесс pid {pid} жив)"
+    return None, "сервер не запущен"
 
 
 def _role_state(client, conn, role: str) -> str:
@@ -74,7 +81,7 @@ def _role_state(client, conn, role: str) -> str:
     if not session_id:
         return "нет сессии"
     if client is None:
-        return "сервер недоступен"
+        return "живые данные недоступны (сервер не отвечает)"
     try:
         messages = client.messages(session_id)
     except Exception:  # noqa: BLE001
@@ -93,8 +100,10 @@ def _role_state(client, conn, role: str) -> str:
 
 
 def _live_section(conn) -> str:
-    client = _server_client()
+    client, note = _server_state()
     lines = ["Сейчас (живое состояние сессий):"]
+    if client is None:
+        lines.append(f"- opencode: {note}")
     for role in team_db.ROLES:
         lines.append(f"- {role}: {_role_state(client, conn, role)}")
     unconsumed = conn.execute("SELECT COUNT(*) AS n FROM events WHERE consumed=0").fetchone()["n"]
@@ -262,6 +271,49 @@ def do_setmodel(conn, args) -> str:
     return "\n".join(lines)
 
 
+def do_compact(conn, args) -> str:
+    thresholds = settings.compact_thresholds()
+    client, note = _server_state()
+    lines = ["Авто-компактирование контекста (порог по tokens.total; 0 = выкл):"]
+    for role in settings.COMPACT_ROLES:
+        session_id = None
+        if role == "secretary":
+            session_id = secretary_session_id()
+        elif conn is not None:
+            session_id = team_db.get_session_id(conn, role)
+        used = "—"
+        if client is not None and session_id:
+            try:
+                used = settings.format_tokens(client.context_usage(session_id)["tokens"])
+            except Exception:  # noqa: BLE001
+                used = "?"
+        lines.append(
+            f"  {role:<10} порог {settings.format_tokens(thresholds.get(role, 0)):<6} "
+            f"сейчас {used}"
+        )
+    if client is None:
+        lines.append(f"({note})")
+    lines.append(
+        "Изменить: setcompact --target {role|all} --tokens {N} (0 = выключить); "
+        "применяется к следующему ходу."
+    )
+    return "\n".join(lines)
+
+
+def do_setcompact(conn, args) -> str:
+    target = (args.target or "").strip()
+    if not target or args.tokens is None:
+        raise Reject("нужны --target (роль|all) и --tokens (0 = выключить)")
+    try:
+        roles = settings.set_compact(target, args.tokens)
+    except ValueError as exc:
+        raise Reject(str(exc)) from None
+    thresholds = settings.compact_thresholds()
+    return "Порог компактирования обновлён: " + ", ".join(
+        f"{role}={settings.format_tokens(thresholds.get(role, 0))}" for role in roles
+    )
+
+
 def do_result(conn, args) -> str:
     if conn is None:
         return "Финального заключения контролёра пока нет."
@@ -289,6 +341,8 @@ def run(argv: list[str]) -> int:
             "result",
             "models",
             "setmodel",
+            "compact",
+            "setcompact",
         ],
     )
     parser.add_argument("--limit", type=int)
@@ -297,6 +351,7 @@ def run(argv: list[str]) -> int:
     parser.add_argument("--task")
     parser.add_argument("--target")
     parser.add_argument("--model")
+    parser.add_argument("--tokens")
     args = parser.parse_args(argv)
 
     expected = secretary_session_id()
@@ -323,6 +378,8 @@ def run(argv: list[str]) -> int:
         "result": do_result,
         "models": do_models,
         "setmodel": do_setmodel,
+        "compact": do_compact,
+        "setcompact": do_setcompact,
     }
     handler = handlers[args.action]
 

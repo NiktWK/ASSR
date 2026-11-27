@@ -31,6 +31,12 @@ class FakeClient:
     def abort(self, session_id):
         pass
 
+    def context_usage(self, session_id):
+        return {"tokens": 0, "model": None}
+
+    def summarize(self, session_id, model, auto=False):
+        pass
+
 
 class BaseTeamTest(unittest.TestCase):
     def setUp(self) -> None:

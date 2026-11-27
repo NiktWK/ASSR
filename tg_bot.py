@@ -31,6 +31,7 @@ from aiogram.types import (
 
 import model_admin
 import run_control
+import settings
 import team
 import team_db
 
@@ -376,6 +377,7 @@ async def ask_secretary(message: Message, text: str) -> None:
         try:
             client = await asyncio.to_thread(get_client)
             session_id = await asyncio.to_thread(ensure_secretary_session, client)
+            await asyncio.to_thread(maybe_compact_secretary, client, session_id)
             result = await asyncio.to_thread(
                 client.prompt,
                 session_id,
@@ -391,6 +393,71 @@ async def ask_secretary(message: Message, text: str) -> None:
             reply = f"Ошибка секретаря: {exc}"
     for chunk in split_text(reply):
         await message.answer(chunk)
+
+
+# --------------------------------------------------------------- context compaction
+
+def maybe_compact_secretary(client, session_id: str) -> None:
+    """Compact the secretary session before a new message when it grew too large."""
+    threshold = settings.compact_threshold(SECRETARY_PROFILE)
+    if not threshold:
+        return
+    try:
+        usage = client.context_usage(session_id)
+        if usage["tokens"] < threshold:
+            return
+        logging.info(
+            "secretary context %s >= %s: compacting", usage["tokens"], threshold
+        )
+        client.summarize(session_id, usage.get("model") or secretary_model())
+    except Exception as exc:  # noqa: BLE001 - never block the answer
+        logging.warning("secretary compaction failed: %s", exc)
+
+
+def compact_text() -> str:
+    thresholds = settings.compact_thresholds()
+    try:
+        client = get_client(ensure=False)
+    except Exception:  # noqa: BLE001
+        client = None
+    ids = _session_ids()
+    lines = ["Авто-компактирование контекста (порог по tokens.total; 0 = выкл):"]
+    for role in settings.COMPACT_ROLES:
+        used = "—"
+        session_id = ids.get(role)
+        if client is not None and session_id:
+            try:
+                used = settings.format_tokens(client.context_usage(session_id)["tokens"])
+            except Exception:  # noqa: BLE001
+                used = "?"
+        lines.append(
+            f"  {role:<10} порог {settings.format_tokens(thresholds.get(role, 0)):<6} "
+            f"сейчас {used}"
+        )
+    if client is None:
+        lines.append("(сервер не отвечает — живые значения недоступны)")
+    lines.append("")
+    lines.append(
+        "Изменить: /compactset <role|all> <N>; 0 — выключить. "
+        "Сжать сейчас: /compactnow <role>"
+    )
+    return "\n".join(lines)
+
+
+def compact_now(role: str) -> str:
+    role = (role or "").strip().lower()
+    if role not in settings.COMPACT_ROLES:
+        return "Роль: controller|researcher|developer|tester|secretary"
+    session_id = _session_ids().get(role)
+    if not session_id:
+        return f"Нет сессии для роли {role}."
+    client = get_client(ensure=False)
+    usage = client.context_usage(session_id)
+    if not usage["tokens"]:
+        return f"У роли {role} ещё нет контекста — сжимать нечего."
+    model = usage.get("model") or team.agent_profile_model(f"{role}-plan") or secretary_model()
+    client.summarize(session_id, model)
+    return f"Контекст {role} сжат (было {settings.format_tokens(usage['tokens'])})."
 
 
 # ------------------------------------------------------------------ model management
@@ -668,7 +735,10 @@ async def h_start(message: Message) -> None:
         "/answer qN <текст> — ответить\n"
         "/cancel — отменить прогон\n"
         "/models — модели агентов\n"
-        "/setmodel <target> <provider/model> — сменить модель\n\n"
+        "/setmodel <target> <provider/model> — сменить модель\n"
+        "/compact — пороги авто-сжатия контекста и текущее заполнение\n"
+        "/compactset <role|all> <N> — задать порог (0 — выключить)\n"
+        "/compactnow <role> — сжать контекст роли сейчас\n\n"
         "Любой обычный текст — вопрос секретарю. Он видит состояние и историю, "
         "может отвечать на вопросы, запускать/отменять прогоны и передавать указания контролёру."
     )
@@ -855,6 +925,55 @@ async def h_setmodel(message: Message, command: CommandObject) -> None:
     if role_profiles or not active:
         await asyncio.to_thread(mark_pending, profiles, model)
         await schedule_apply(message.bot, message.chat.id)
+
+
+@router.message(Command("compact"))
+async def h_compact(message: Message) -> None:
+    text = await asyncio.to_thread(compact_text)
+    for chunk in split_text(text):
+        await message.answer(chunk)
+
+
+@router.message(Command("compactset"))
+async def h_compactset(message: Message, command: CommandObject) -> None:
+    parts = (command.args or "").split()
+    if len(parts) != 2:
+        await message.answer(
+            "Использование: /compactset <role|all> <N>\n"
+            "role: controller|researcher|developer|tester|secretary; "
+            "N — токены (0 — выключить). Текущие пороги: /compact"
+        )
+        return
+    target, value = parts
+    try:
+        roles = await asyncio.to_thread(settings.set_compact, target, value)
+    except ValueError as exc:
+        await message.answer(f"❌ {exc}")
+        return
+    thresholds = await asyncio.to_thread(settings.compact_thresholds)
+    await message.answer(
+        "✅ Порог обновлён: "
+        + ", ".join(
+            f"{role}={settings.format_tokens(thresholds.get(role, 0))}" for role in roles
+        )
+        + ".\nПрименится к следующему ходу."
+    )
+
+
+@router.message(Command("compactnow"))
+async def h_compactnow(message: Message, command: CommandObject) -> None:
+    role = (command.args or "").strip()
+    if not role:
+        await message.answer("Использование: /compactnow <role>")
+        return
+    await message.answer("Сжимаю контекст…")
+    try:
+        text = await asyncio.to_thread(compact_now, role)
+    except Exception as exc:  # noqa: BLE001 - report to the operator
+        logging.exception("compaction failed")
+        await message.answer(f"❌ Не удалось сжать: {exc}")
+        return
+    await message.answer(text)
 
 
 @router.callback_query(F.data.startswith("q:"))
@@ -1047,6 +1166,9 @@ async def run_bot(token: str, chat_id: int) -> None:
             BotCommand(command="cancel", description="отменить прогон"),
             BotCommand(command="models", description="модели агентов"),
             BotCommand(command="setmodel", description="сменить модель агента"),
+            BotCommand(command="compact", description="пороги авто-сжатия контекста"),
+            BotCommand(command="compactset", description="задать порог сжатия"),
+            BotCommand(command="compactnow", description="сжать контекст роли"),
             BotCommand(command="ask", description="спросить секретаря"),
         ]
     )

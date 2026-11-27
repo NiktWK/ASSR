@@ -35,6 +35,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+import settings
 import team_db
 
 PROJECT = Path(__file__).resolve().parent
@@ -266,6 +267,50 @@ class OpenCode:
             self.request("POST", f"/session/{quote(session_id, safe='')}/abort", {}, timeout=30)
         except OpenCodeError:
             pass
+
+    def context_usage(self, session_id: str) -> dict:
+        """Last assistant turn: context size (tokens.total) and the model that produced it."""
+        for message in reversed(self.messages(session_id)):
+            info = message.get("info") or {}
+            if info.get("role") != "assistant":
+                continue
+            tokens = info.get("tokens") or {}
+            total = tokens.get("total")
+            if total is None:
+                total = sum(int(tokens.get(k) or 0) for k in ("input", "output", "reasoning"))
+                total += int((tokens.get("cache") or {}).get("read") or 0)
+            if int(total or 0) <= 0:
+                # aborted/failed turn (provider error) carries empty usage and
+                # would hide the real context size of the previous turn
+                continue
+            model = None
+            if info.get("providerID") and info.get("modelID"):
+                model = {
+                    "providerID": info["providerID"],
+                    "modelID": info["modelID"],
+                }
+            return {"tokens": int(total or 0), "model": model}
+        return {"tokens": 0, "model": None}
+
+    def summarize(self, session_id: str, model: dict | None, auto: bool = False) -> None:
+        """AI-compact a session so its context shrinks (native opencode endpoint).
+
+        auto=False: only produce the summary; auto=True would also make the agent
+        continue the interrupted turn, which the orchestrator must control itself.
+        """
+        if not model or not model.get("providerID") or not model.get("modelID"):
+            raise OpenCodeError("для компактирования нужна модель provider/model")
+        body = {
+            "providerID": model["providerID"],
+            "modelID": model["modelID"],
+            "auto": auto,
+        }
+        self.request(
+            "POST",
+            f"/session/{quote(session_id, safe='')}/summarize",
+            body,
+            timeout=900,
+        )
 
 
 def extract_text(result) -> str:
@@ -644,6 +689,35 @@ class Orchestrator:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events").fetchone()
         return int(row["m"])
 
+    def maybe_compact(self, role: str, agent: str) -> None:
+        """Compact the role's session when its context exceeds the configured threshold.
+
+        Best effort: a failed measurement or summary must never stop the run.
+        """
+        threshold = settings.compact_threshold(role)
+        session_id = self.sessions.get(role)
+        if not threshold or not session_id:
+            return
+        try:
+            usage = self.client.context_usage(session_id)
+        except OpenCodeError as exc:
+            self.log(f"⚠ {agent}: не удалось измерить контекст: {exc}")
+            return
+        tokens = usage["tokens"]
+        if tokens < threshold:
+            return
+        self.log(
+            f"⋯ {agent}: контекст {settings.format_tokens(tokens)} ≥ "
+            f"{settings.format_tokens(threshold)} — сжимаю"
+        )
+        model = usage.get("model") or agent_profile_model(agent)
+        try:
+            self.client.summarize(session_id, model)
+        except OpenCodeError as exc:
+            self.log(f"⚠ {agent}: компактирование не удалось: {exc}")
+            return
+        self.log(f"✓ {agent}: контекст сжат")
+
     def send(self, role: str, phase: str, message: str, restart: bool = False) -> str:
         agent = f"{role}-{phase}"
         if restart:
@@ -652,6 +726,7 @@ class Orchestrator:
             team_db.ensure_phase(self.conn, role, phase)
         if team_db.get_phase(self.conn, role) != phase:
             raise RuntimeError(f"не удалось переключить {role} в фазу {phase}")
+        self.maybe_compact(role, agent)
         prompt_time = time.strftime("%H:%M:%S")
         self.log(f"→ {agent}: {short(message.splitlines()[0] if message.splitlines() else message)}")
         self.chat(role, "ПРОМПТ", agent, message)

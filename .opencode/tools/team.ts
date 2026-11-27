@@ -69,11 +69,18 @@ export default tool({
       const value = args[key]
       if (value !== undefined) cmd.push(flag, String(value))
     }
-    const proc = Bun.spawnSync({ cmd, stdout: "pipe", stderr: "pipe" })
-    const out = proc.stdout.toString().trim()
-    const err = proc.stderr.toString().trim()
-    if (proc.exitCode !== 0) {
-      throw new Error(err || out || `team_agent.py exited with code ${proc.exitCode}`)
+    // Async spawn: spawnSync would freeze the server event loop (watchdog polls,
+    // secretary health checks) for the whole duration of the call.
+    const proc = Bun.spawn({ cmd, stdout: "pipe", stderr: "pipe" })
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    const out = stdout.trim()
+    const err = stderr.trim()
+    if (code !== 0) {
+      throw new Error(err || out || `team_agent.py exited with code ${code}`)
     }
     return out || "ok"
   },
