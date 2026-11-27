@@ -156,13 +156,35 @@ class OpenCode:
                     text_len += len(part["text"])
         return (len(messages), total, text_len)
 
+    @staticmethod
+    def _tools_running(messages) -> bool:
+        """True when any recent tool call is still executing (long bash, ssh, ...)."""
+        for message in (messages or [])[-4:]:
+            for part in message.get("parts") or []:
+                if not isinstance(part, dict) or part.get("type") != "tool":
+                    continue
+                status = (part.get("state") or {}).get("status")
+                if status not in ("completed", "error"):
+                    return True
+        return False
+
+    @staticmethod
+    def _watchdog_step(busy, sig, signature, last_change, now, stall_timeout):
+        """One watchdog decision: (signature, last_change, stalled).
+
+        A running tool counts as activity, so a long command never looks like a hang.
+        """
+        if busy or sig != signature:
+            return sig, now, False
+        return signature, last_change, bool(stall_timeout and now - last_change > stall_timeout)
+
     def prompt(
         self,
         session_id: str,
         agent: str,
         text: str,
         attempts: int = 3,
-        stall_timeout: int = 300,
+        stall_timeout: int = 600,
         model: dict | None = None,
     ):
         path = f"/session/{quote(session_id, safe='')}/message"
@@ -189,14 +211,16 @@ class OpenCode:
                 if not thread.is_alive():
                     break
                 try:
-                    sig = self._signature(self.messages(session_id))
+                    messages = self.messages(session_id)
+                    sig = self._signature(messages)
+                    busy = self._tools_running(messages)
                 except Exception:  # noqa: BLE001 - watchdog is best effort
                     sig = signature
-                if sig != signature:
-                    signature = sig
-                    last_change = time.time()
-                elif stall_timeout and time.time() - last_change > stall_timeout:
-                    stalled = True
+                    busy = True  # cannot observe -> do not abort on a monitoring failure
+                signature, last_change, stalled = self._watchdog_step(
+                    busy, sig, signature, last_change, time.time(), stall_timeout
+                )
+                if stalled:
                     self.abort(session_id)
                     break
             if stalled:
@@ -633,20 +657,21 @@ class Orchestrator:
         self.chat(role, "ПРОМПТ", agent, message)
         before = self.last_event_id()
         model = agent_profile_model(agent)
-        for attempt in (1, 2):
+        attempts = 4
+        for attempt in range(1, attempts + 1):
             try:
                 result = self.client.prompt(self.sessions[role], agent, message, model=model)
                 break
             except OpenCodeError as exc:
                 self.log(f"✗ {agent}: {exc}")
-                if (self.run_dir / "cancel").exists():
+                if CANCEL_FILE.exists():
                     raise RunCancelled("прогон отменён оператором") from None
                 if self.last_event_id() > before:
                     raise
-                if attempt == 2:
+                if attempt == attempts:
                     raise
                 self.log(f"↻ {agent}: повтор хода после сбоя ({prompt_time})")
-                time.sleep(3)
+                time.sleep(min(5 * attempt, 30))
         text = extract_text(result)
         self.chat(role, "ОТВЕТ", agent, text or "(пустой текстовый ответ; см. инструменты в сессии)")
         self.log(f"← {agent}: {short(text) if text else '(ответ без текста)'}")

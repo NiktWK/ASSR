@@ -11,6 +11,7 @@ import argparse
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import model_admin
@@ -21,6 +22,12 @@ import team_db
 PROJECT = Path(__file__).resolve().parent
 RUN_DIR = PROJECT / "run"
 SECRETARY_FILE = RUN_DIR / "secretary.json"
+
+STATUS_LEGEND = (
+    "Статусы задач: plan_pending — назначена, ждёт план; plan_review — план сдан, "
+    "ждёт ревью; build_pending — план одобрен, идёт/ожидается BUILD; "
+    "build_review — отчёт BUILD сдан, ждёт ревью; done — закрыта."
+)
 
 
 class Reject(Exception):
@@ -53,6 +60,52 @@ def _run_status() -> tuple[str, str, str]:
         conn.close()
 
 
+def _server_client():
+    server = team.load_server()
+    if not server:
+        return None
+    client = team.OpenCode(server["url"], server.get("password"), timeout=20)
+    return client if client.health() else None
+
+
+def _role_state(client, conn, role: str) -> str:
+    """Describe what a role is doing right now by inspecting its live session."""
+    session_id = team_db.get_session_id(conn, role)
+    if not session_id:
+        return "нет сессии"
+    if client is None:
+        return "сервер недоступен"
+    try:
+        messages = client.messages(session_id)
+    except Exception:  # noqa: BLE001
+        return "сессию не удалось прочитать"
+    if not messages:
+        return "ещё не работал"
+    info = messages[-1].get("info") or {}
+    t = info.get("time") or {}
+    activity = t.get("completed") or t.get("created")
+    when = time.strftime("%H:%M:%S", time.localtime(activity / 1000)) if activity else "?"
+    if info.get("role") == "user":
+        return f"ход запускается (промпт {when})"
+    if not t.get("completed"):
+        return f"идёт ход (с {when})"
+    return f"простаивает (последняя активность {when})"
+
+
+def _live_section(conn) -> str:
+    client = _server_client()
+    lines = ["Сейчас (живое состояние сессий):"]
+    for role in team_db.ROLES:
+        lines.append(f"- {role}: {_role_state(client, conn, role)}")
+    unconsumed = conn.execute("SELECT COUNT(*) AS n FROM events WHERE consumed=0").fetchone()["n"]
+    active = run_control.is_active()
+    lines.append(
+        f"оркестратор: {'активен' if active else 'не активен'}; "
+        f"неразобранных событий: {unconsumed}"
+    )
+    return "\n".join(lines)
+
+
 def do_status(conn, args) -> str:
     if not team_db.db_path().exists():
         return (
@@ -66,7 +119,11 @@ def do_status(conn, args) -> str:
         f"задача: {task[:400]}" if task else "задача: (нет)",
         f"оркестратор: {'активен' if run_control.is_active() else 'не активен'}",
         "",
+        _live_section(conn),
+        "",
         team_db.summary(conn),
+        "",
+        STATUS_LEGEND,
     ]
     open_q = team_db.open_questions(conn, "human")
     lines.append(f"\nОткрытых вопросов человеку: {len(open_q)}")
@@ -77,12 +134,14 @@ def do_status(conn, args) -> str:
 
 def do_tasks(conn, args) -> str:
     rows = team_db.list_tasks(conn)
-    if not rows:
-        return "Задач пока нет."
-    return "\n".join(
-        f"- {r['id']} ({r['worker']}): {r['status']}; цель: {r['goal']}"
-        for r in rows
-    )
+    if rows:
+        body = "\n".join(
+            f"- {r['id']} ({r['worker']}): {r['status']}; цель: {r['goal']}"
+            for r in rows
+        )
+    else:
+        body = "Задач пока нет."
+    return body + "\n\n" + _live_section(conn) + "\n\n" + STATUS_LEGEND
 
 
 def do_events(conn, args) -> str:

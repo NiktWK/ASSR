@@ -34,6 +34,17 @@ def _console_file(run_dir: Path) -> Path:
     return run_dir / "console.log"
 
 
+def _meta_run_tag(run_dir: Path) -> str:
+    try:
+        conn = team_db.connect(run_dir / "state.db")
+        try:
+            return team_db.get_meta(conn, "run_tag", "") or ""
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 class RunBusy(Exception):
     """A run is already active."""
 
@@ -92,7 +103,7 @@ def start_run(task: str, resume: bool = False, resume_tag: str | None = None) ->
             run_dir = target_run_dir(resume_tag)
             if not (run_dir / "state.db").exists():
                 raise RunError("нечего продолжать: сохранённый прогон не найден")
-            run_tag = resume_tag or run_dir.name
+            run_tag = resume_tag or _meta_run_tag(run_dir) or run_dir.name
         else:
             run_tag = time.strftime("%Y%m%d-%H%M%S")
             run_dir = RUNS_DIR / run_tag

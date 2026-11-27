@@ -129,6 +129,72 @@ class LoadSessionsTest(unittest.TestCase):
             conn.close()
 
 
+class WatchdogTest(unittest.TestCase):
+    def test_tools_running_detected(self) -> None:
+        running = [{"parts": [{"type": "tool", "tool": "bash", "state": {"status": "running"}}]}]
+        done = [{"parts": [{"type": "tool", "tool": "bash", "state": {"status": "completed"}}]}]
+        self.assertTrue(team.OpenCode._tools_running(running))
+        self.assertFalse(team.OpenCode._tools_running(done))
+        self.assertFalse(team.OpenCode._tools_running([]))
+
+    def test_busy_prevents_stall(self) -> None:
+        sig = (1, 2, 3)
+        _, last_change, stalled = team.OpenCode._watchdog_step(True, sig, sig, 0, 1000, 300)
+        self.assertFalse(stalled)
+        self.assertEqual(last_change, 1000)
+
+    def test_stall_on_unchanged_idle_signature(self) -> None:
+        sig = (1, 2, 3)
+        _, _, stalled = team.OpenCode._watchdog_step(False, sig, sig, 0, 1000, 300)
+        self.assertTrue(stalled)
+        _, _, stalled = team.OpenCode._watchdog_step(False, sig, sig, 900, 1000, 300)
+        self.assertFalse(stalled)
+
+    def test_signature_change_prevents_stall(self) -> None:
+        _, last_change, stalled = team.OpenCode._watchdog_step(
+            False, (1, 2, 4), (1, 2, 3), 0, 1000, 300
+        )
+        self.assertFalse(stalled)
+        self.assertEqual(last_change, 1000)
+
+
+class SendRetryTest(unittest.TestCase):
+    def test_send_retries_stall_more_than_twice(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="send-"))
+        db = tmp / "state.db"
+        team_db.init(db)
+        conn = team_db.connect(db)
+        for role in team.ROLES:
+            team_db.set_session(conn, role, f"ses_{role}")
+        conn.close()
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def prompt(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls < 4:
+                    raise team.OpenCodeError("ход завис")
+                return {"parts": [{"type": "text", "text": "ok"}]}
+
+        client = Client()
+        sessions = {role: f"ses_{role}" for role in team.ROLES}
+        orch = team.Orchestrator(
+            "t", {"url": "http://x", "password": ""}, sessions,
+            timeout=1, db_path=db, run_dir=tmp,
+        )
+        orch.client = client
+        try:
+            with mock.patch.object(team, "CANCEL_FILE", tmp / "cancel"), \
+                 mock.patch.object(team.time, "sleep"):
+                result = orch.send("developer", "build", "msg")
+        finally:
+            orch.conn.close()
+        self.assertEqual(result, "ok")
+        self.assertEqual(client.calls, 4)
+
+
 class RestartServerTest(unittest.TestCase):
     def test_keep_auth_no_saved_server_uses_ensure(self) -> None:
         with mock.patch.object(team, "load_server", return_value=None), mock.patch.object(

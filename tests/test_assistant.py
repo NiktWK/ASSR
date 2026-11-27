@@ -16,6 +16,14 @@ import run_control
 import team_db
 
 
+class _FakeSessionClient:
+    def __init__(self, last_info: dict):
+        self._last = last_info
+
+    def messages(self, session_id):
+        return [{"info": self._last}]
+
+
 class AssistantTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="assistant-"))
@@ -37,8 +45,13 @@ class AssistantTest(unittest.TestCase):
         conn.close()
         self.old_env = os.environ.get("TEAM_DB")
         os.environ["TEAM_DB"] = str(self.db)
+        self._server_patch = mock.patch.object(
+            assistant_agent.team, "load_server", return_value=None
+        )
+        self._server_patch.start()
 
     def tearDown(self) -> None:
+        self._server_patch.stop()
         (
             assistant_agent.RUN_DIR,
             assistant_agent.SECRETARY_FILE,
@@ -67,6 +80,40 @@ class AssistantTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("run_status=running", out)
         self.assertIn("тестовая задача", out)
+
+    def test_status_includes_live_state_and_legend(self) -> None:
+        rc, out, _ = self.call("status")
+        self.assertEqual(rc, 0)
+        self.assertIn("Сейчас (живое состояние сессий)", out)
+        self.assertIn("неразобранных событий", out)
+        self.assertIn("build_pending — план одобрен", out)
+
+    def test_tasks_includes_legend(self) -> None:
+        rc, out, _ = self.call("tasks")
+        self.assertEqual(rc, 0)
+        self.assertIn("plan_review", out)
+
+    def test_role_state_in_flight(self) -> None:
+        conn = team_db.connect(self.db)
+        try:
+            client = _FakeSessionClient(
+                {"role": "assistant", "time": {"created": 0, "completed": None}}
+            )
+            self.assertIn("идёт ход", assistant_agent._role_state(client, conn, "developer"))
+        finally:
+            conn.close()
+
+    def test_role_state_idle(self) -> None:
+        conn = team_db.connect(self.db)
+        try:
+            client = _FakeSessionClient(
+                {"role": "assistant", "time": {"created": 0, "completed": 1}}
+            )
+            self.assertIn(
+                "простаивает", assistant_agent._role_state(client, conn, "developer")
+            )
+        finally:
+            conn.close()
 
     def test_tasks_and_events(self) -> None:
         conn = team_db.connect(self.db)
