@@ -11,6 +11,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import team
 import team_agent
@@ -20,9 +21,11 @@ import team_db
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
+        self.models: list[tuple[str, object]] = []
 
-    def prompt(self, session_id, agent, text, attempts=3):
+    def prompt(self, session_id, agent, text, attempts=3, stall_timeout=300, model=None):
         self.calls.append((session_id, agent, text))
+        self.models.append((agent, model))
         return {"parts": [{"type": "text", "text": f"fake:{agent}"}]}
 
     def abort(self, session_id):
@@ -196,6 +199,12 @@ class FullFlowTest(BaseTeamTest):
             self.assertEqual(team_db.get_meta(conn, "run_status"), "done")
         finally:
             conn.close()
+
+    def test_send_passes_configured_model(self) -> None:
+        model = {"providerID": "anymodel", "modelID": "glm-5.3-flash"}
+        with mock.patch.object(team, "agent_profile_model", return_value=model):
+            self.orch.send("developer", "build", "тестовое сообщение")
+        self.assertEqual(self.fake.models[-1], ("developer-build", model))
 
     def test_inject_reaches_controller(self) -> None:
         conn = team_db.connect(self.db)

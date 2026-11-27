@@ -275,72 +275,95 @@ def config_mtime() -> float:
     return max(stamps) if stamps else 0.0
 
 
-def stop_pid(pid) -> None:
+MODEL_CACHE: dict = {"mtime": None, "models": {}}
+
+
+def parse_model_id(value: str | None) -> dict | None:
+    provider, sep, model = (value or "").partition("/")
+    if not sep or not provider or not model:
+        return None
+    return {"providerID": provider, "modelID": model}
+
+
+def agent_config_models() -> dict[str, str]:
+    """profile -> configured model string, re-read whenever opencode.json changes."""
+    path = PROJECT / "opencode.json"
     try:
-        os.kill(int(pid), 15)
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    if MODEL_CACHE.get("mtime") != mtime:
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        MODEL_CACHE["mtime"] = mtime
+        MODEL_CACHE["models"] = {
+            name: (cfg or {}).get("model")
+            for name, cfg in (data.get("agent") or {}).items()
+            if isinstance(cfg, dict)
+        }
+    return dict(MODEL_CACHE.get("models") or {})
+
+
+def agent_profile_model(profile: str) -> dict | None:
+    return parse_model_id(agent_config_models().get(profile))
+
+
+def pid_is_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_pid(pid, force: bool = False) -> None:
+    try:
+        os.kill(int(pid), 9 if force else 15)
     except (TypeError, ValueError, ProcessLookupError, PermissionError):
         pass
 
 
-def ensure_server(port_start: int, verbose: bool = True) -> dict:
-    saved = load_server()
-    if saved:
-        client = OpenCode(saved["url"], saved.get("password"))
-        stale = float(saved.get("started") or 0) < config_mtime()
-        if not stale and client.health():
-            if verbose:
-                print(f"Использую уже запущенный сервер {saved['url']}")
-            return saved
-        if stale and saved.get("pid"):
-            if verbose:
-                print("Конфигурация/промпты изменились после старта сервера — перезапускаю сервер.")
-            stop_pid(saved.get("pid"))
-            time.sleep(1)
-
-    password = secrets.token_urlsafe(18)
-    port = None
-    for candidate in range(port_start, port_start + 50):
-        if port_is_free(candidate):
-            port = candidate
-            break
-    if port is None:
-        raise SystemExit("не найден свободный порт для opencode serve")
-
+def _spawn_server(port: int, password: str) -> subprocess.Popen:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     log = open(RUN_DIR / "server.log", "ab")
     env = os.environ.copy()
     env["OPENCODE_SERVER_PASSWORD"] = password
     env["TEAM_DB"] = str(DB_PATH)
-    cmd = [
-        "opencode", "serve", "--hostname", "127.0.0.1", "--port", str(port)
-    ]
-    if verbose:
-        print(f"Запускаю {' '.join(cmd)} (cwd={PROJECT})")
+    return subprocess.Popen(
+        ["opencode", "serve", "--hostname", "127.0.0.1", "--port", str(port)],
+        cwd=str(PROJECT),
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
+def _start_server(port: int, password: str, verbose: bool, base: dict | None = None) -> dict:
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT),
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        proc = _spawn_server(port, password)
     except FileNotFoundError:
         raise SystemExit("opencode не найден в PATH") from None
-
     url = f"http://127.0.0.1:{port}"
     client = OpenCode(url, password)
     deadline = time.time() + 60
     while time.time() < deadline:
         if client.health():
-            info = {
-                "url": url,
-                "port": port,
-                "password": password,
-                "pid": proc.pid,
-                "project": str(PROJECT),
-                "started": time.time(),
-            }
+            info = dict(base or {})
+            info.update(
+                {
+                    "url": url,
+                    "port": port,
+                    "password": password,
+                    "pid": proc.pid,
+                    "project": str(PROJECT),
+                    "started": time.time(),
+                }
+            )
             SERVER_FILE.write_text(json.dumps(info, ensure_ascii=False, indent=2), "utf-8")
             if verbose:
                 print(f"Сервер готов: {url}")
@@ -354,6 +377,119 @@ def ensure_server(port_start: int, verbose: bool = True) -> dict:
             raise SystemExit(f"opencode serve завершился при старте:\n{tail}")
         time.sleep(0.5)
     raise SystemExit("opencode serve не ответил за 60 секунд; смотри run/server.log")
+
+
+def _wait_port_free(port: int, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if port_is_free(port):
+            return True
+        time.sleep(0.3)
+    return port_is_free(port)
+
+
+def _stop_and_wait(pid, timeout: float = 15.0) -> None:
+    if not pid or not pid_is_alive(pid):
+        return
+    stop_pid(pid)
+    deadline = time.time() + timeout
+    while pid_is_alive(pid) and time.time() < deadline:
+        time.sleep(0.3)
+    if pid_is_alive(pid):
+        stop_pid(pid, force=True)
+        time.sleep(0.5)
+
+
+def ensure_server(port_start: int, verbose: bool = True) -> dict:
+    saved = load_server()
+    if saved:
+        client = OpenCode(saved["url"], saved.get("password"))
+        stale = float(saved.get("started") or 0) < config_mtime()
+        if not stale and client.health():
+            if verbose:
+                print(f"Использую уже запущенный сервер {saved['url']}")
+            return saved
+        if saved.get("pid") and saved.get("port") and saved.get("password"):
+            if verbose:
+                reason = "конфигурация изменилась" if stale else "сервер не отвечает"
+                print(f"{reason} — перезапускаю сервер {saved['url']}")
+            _stop_and_wait(saved["pid"])
+            if _wait_port_free(saved["port"]):
+                return _start_server(saved["port"], saved["password"], verbose, base=saved)
+
+    password = secrets.token_urlsafe(18)
+    port = None
+    for candidate in range(port_start, port_start + 50):
+        if port_is_free(candidate):
+            port = candidate
+            break
+    if port is None:
+        raise SystemExit("не найден свободный порт для opencode serve")
+    return _start_server(port, password, verbose)
+
+
+def reload_config(timeout: float = 15.0, verbose: bool = True) -> tuple[bool, str]:
+    """Hot-reload the opencode instance config without killing the server.
+
+    POST /instance/dispose releases the instance; the next request rebuilds it from
+    opencode.json. The server process, port, password and sessions survive.
+    """
+    server = load_server()
+    if not server:
+        try:
+            server = ensure_server(4096, verbose=verbose)
+        except SystemExit as exc:
+            return False, str(exc)
+    client = OpenCode(server["url"], server.get("password"), timeout=60)
+    expected = {
+        profile: model
+        for profile, model in agent_config_models().items()
+        if model
+    }
+    try:
+        client.request("POST", "/instance/dispose", {}, timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"не удалось перезагрузить конфиг: {exc}"
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        try:
+            config = client.request("GET", "/config", timeout=30)
+            agents = (config or {}).get("agent") or {}
+            last = {
+                profile: (agents.get(profile) or {}).get("model")
+                for profile in expected
+            }
+            if all(last.get(profile) == model for profile, model in expected.items()):
+                return True, "Конфиг перезагружен: модели применены к текущим сессиям."
+        except Exception:  # noqa: BLE001 - instance is rebuilding
+            pass
+        time.sleep(0.3)
+    if not expected:
+        return True, "Конфиг перезагружен."
+    return False, (
+        "экземпляр перезагружен, но конфиг не совпал: "
+        + json.dumps(last, ensure_ascii=False)
+    )
+
+
+def restart_server_keep_auth(verbose: bool = True) -> tuple[bool, str]:
+    """Restart opencode serve keeping port and password so connected clients survive."""
+    saved = load_server()
+    if not saved or not saved.get("port") or not saved.get("password"):
+        try:
+            info = ensure_server(4096, verbose=verbose)
+        except SystemExit as exc:
+            return False, str(exc)
+        return True, f"Сервер запущен: {info['url']}"
+    _stop_and_wait(saved.get("pid"))
+    if not _wait_port_free(saved["port"]):
+        return False, f"порт {saved['port']} занят после остановки сервера"
+    try:
+        info = _start_server(saved["port"], saved["password"], verbose, base=saved)
+    except SystemExit as exc:
+        return False, str(exc)
+    return True, f"Сервер перезапущен: {info['url']}, модели из конфига применены"
 
 
 def ensure_plugin_deps() -> None:
@@ -468,9 +604,10 @@ class Orchestrator:
         self.log(f"→ {agent}: {short(message.splitlines()[0] if message.splitlines() else message)}")
         self.chat(role, "ПРОМПТ", agent, message)
         before = self.last_event_id()
+        model = agent_profile_model(agent)
         for attempt in (1, 2):
             try:
-                result = self.client.prompt(self.sessions[role], agent, message)
+                result = self.client.prompt(self.sessions[role], agent, message, model=model)
                 break
             except OpenCodeError as exc:
                 self.log(f"✗ {agent}: {exc}")

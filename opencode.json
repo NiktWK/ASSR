@@ -107,7 +107,7 @@
     "tester-plan": {
       "mode": "primary",
       "description": "Тестировщик: план проверки по существу (PLAN)",
-      "model": "anymodel/ds/deepseek-v4.1-flash",
+      "model": "anymodel/glm-5.3-flash",
       "prompt": "{file:./prompts/tester-plan.md}",
       "permission": {
         "*": "deny",

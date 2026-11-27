@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 from urllib.request import urlopen
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -53,6 +54,16 @@ KIND_RU = {
     "accept_final": "приёмка финального результата",
     "agent": "вопрос агента",
 }
+ROLE_PROFILES = [
+    f"{role}-{phase}"
+    for role in ("controller", "researcher", "developer", "tester")
+    for phase in ("plan", "build")
+]
+SECRETARY_PROFILE = "secretary"
+ALL_MODEL_TARGETS = ROLE_PROFILES + [SECRETARY_PROFILE]
+SHORT_ROLES = ("controller", "researcher", "developer", "tester")
+PENDING_FILE = RUN_DIR / "models_pending.json"
+APPLY = {"dirty": False, "task": None, "restarting": False}
 
 router = Router()
 secretary_lock = asyncio.Lock()
@@ -102,23 +113,12 @@ def save_state(state: dict) -> None:
 
 
 def parse_model_id(value: str) -> dict | None:
-    provider, sep, model = (value or "").partition("/")
-    if not sep or not provider or not model:
-        return None
-    return {"providerID": provider, "modelID": model}
+    return team.parse_model_id(value)
 
 
 def secretary_model() -> dict | None:
-    """Read the secretary model from opencode.json for a per-message override.
-
-    The running opencode server caches its config at startup; this lets a model change
-    apply to the bot immediately without restarting the server (and an active run).
-    """
-    try:
-        data = json.loads((PROJECT / "opencode.json").read_text("utf-8"))
-        return parse_model_id(data["agent"]["secretary"]["model"])
-    except (OSError, KeyError, TypeError, json.JSONDecodeError):
-        return None
+    """Secretary model for a per-message override (server config cache independent)."""
+    return team.agent_profile_model(SECRETARY_PROFILE)
 
 
 def split_text(text: str, limit: int = MAX_LEN) -> list[str]:
@@ -368,6 +368,9 @@ def prepare_secretary() -> str:
 
 
 async def ask_secretary(message: Message, text: str) -> None:
+    if APPLY["restarting"]:
+        await message.answer("Сейчас применяю модели (перезапуск сервера). Повторите через несколько секунд.")
+        return
     async with secretary_lock:
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
         try:
@@ -388,6 +391,259 @@ async def ask_secretary(message: Message, text: str) -> None:
             reply = f"Ошибка секретаря: {exc}"
     for chunk in split_text(reply):
         await message.answer(chunk)
+
+
+# ------------------------------------------------------------------ model management
+
+def expand_targets(target: str) -> list[str] | None:
+    target = (target or "").strip().lower()
+    if target in ALL_MODEL_TARGETS:
+        return [target]
+    if target in SHORT_ROLES:
+        return [f"{target}-plan", f"{target}-build"]
+    if target in ("all", "*"):
+        return list(ALL_MODEL_TARGETS)
+    return None
+
+
+def _session_ids() -> dict[str, str]:
+    ids: dict[str, str] = {}
+    if DB_PATH.exists():
+        try:
+            conn = team_db.connect(DB_PATH)
+            try:
+                ids = {
+                    row["role"]: row["session_id"]
+                    for row in conn.execute("SELECT role, session_id FROM sessions")
+                }
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            ids = {}
+    try:
+        ids[SECRETARY_PROFILE] = json.loads(SECRETARY_FILE.read_text("utf-8"))["session_id"]
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+    return ids
+
+
+def last_used_models() -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        client = get_client(ensure=False)
+    except Exception:  # noqa: BLE001
+        return result
+    for role, session_id in _session_ids().items():
+        try:
+            messages = client.messages(session_id)
+        except Exception:  # noqa: BLE001
+            continue
+        for message in reversed(messages):
+            info = message.get("info", {})
+            if info.get("role") == "assistant" and info.get("modelID"):
+                result[role] = f"{info.get('providerID')}/{info.get('modelID')}"
+                break
+    return result
+
+
+def models_text() -> str:
+    configured = team.agent_config_models()
+    lines = ["Модели агентов (opencode.json):"]
+    for profile in ALL_MODEL_TARGETS:
+        lines.append(f"  {profile:<18} {configured.get(profile) or '(не задана)'}")
+    used = last_used_models()
+    if used:
+        lines.append("")
+        lines.append("Последние фактические модели сессий:")
+        for role, model in used.items():
+            lines.append(f"  {role}: {model}")
+    server = team.load_server()
+    if server:
+        lines.append("")
+        lines.append(
+            f"Сервер загружен {time.strftime('%H:%M:%S', time.localtime(server.get('started', 0)))}; "
+            f"конфиг изменён {time.strftime('%H:%M:%S', time.localtime(team.config_mtime()))}"
+        )
+        if team.config_mtime() > float(server.get("started") or 0):
+            lines.append(
+                "Конфиг новее сервера: на TUI-сессиях действует кэш; /setmodel применит изменения."
+            )
+    return "\n".join(lines)
+
+
+def write_model_config(profiles: list[str], model: str, path: Path | None = None) -> None:
+    path = Path(path) if path else (PROJECT / "opencode.json")
+    original = path.read_text("utf-8")
+    try:
+        (RUN_DIR / "opencode.json.bak").write_text(original, "utf-8")
+    except OSError:
+        pass
+    data = json.loads(original)
+    for profile in profiles:
+        data.setdefault("agent", {}).setdefault(profile, {})["model"] = model
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", "utf-8")
+    os.replace(tmp, path)
+    team.MODEL_CACHE["mtime"] = None
+
+
+def live_model_check(model: str) -> tuple[bool, str]:
+    parsed = team.parse_model_id(model)
+    if not parsed:
+        return False, "нужен формат provider/model"
+    try:
+        client = get_client(ensure=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"сервер недоступен: {exc}"
+    session_id = None
+    try:
+        session_id = client.create_session("team/model-check")
+        result = client.prompt(
+            session_id,
+            "plan",
+            "Ответь ровно одним словом: ок. Не вызывай инструменты.",
+            attempts=1,
+            stall_timeout=90,
+            model=parsed,
+        )
+        info = (result or {}).get("info") or {}
+        used = f"{info.get('providerID')}/{info.get('modelID')}"
+        if info.get("error"):
+            return False, f"провайдер вернул ошибку ({used or model})"
+        return True, used or "(модель не указана в ответе)"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    finally:
+        if session_id:
+            try:
+                client.request("DELETE", f"/session/{quote(session_id, safe='')}", timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _sessions_quiescent() -> bool:
+    if not DB_PATH.exists():
+        return True
+    try:
+        client = get_client(ensure=False)
+    except Exception:  # noqa: BLE001
+        return False
+    for session_id in _session_ids().values():
+        try:
+            messages = client.messages(session_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if not messages:
+            continue
+        info = messages[-1].get("info", {})
+        if info.get("role") != "assistant":
+            return False
+        if not (info.get("time") or {}).get("completed"):
+            return False
+    return True
+
+
+def _no_unconsumed_events() -> bool:
+    if not DB_PATH.exists():
+        return True
+    try:
+        conn = team_db.connect(DB_PATH)
+        try:
+            row = conn.execute("SELECT COUNT(*) AS n FROM events WHERE consumed=0").fetchone()
+            return int(row["n"]) == 0
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def _open_human_question() -> bool:
+    if not DB_PATH.exists():
+        return False
+    try:
+        conn = team_db.connect(DB_PATH)
+        try:
+            return bool(team_db.open_questions(conn, "human"))
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def safe_window_ready() -> bool:
+    """True when no agent turn is in flight and no event is waiting to be routed.
+
+    /instance/dispose silently cuts an in-flight turn, so we never reload during one.
+    A waiting human question is a reliable idle point; otherwise require a sustained idle.
+    """
+    if not run_control.is_active():
+        return True
+    if not _sessions_quiescent() or not _no_unconsumed_events():
+        return False
+    if _open_human_question():
+        return True
+    time.sleep(1.5)
+    if not run_control.is_active():
+        return True
+    return _sessions_quiescent() and _no_unconsumed_events()
+
+
+def mark_pending(profiles: list[str], model: str) -> None:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    PENDING_FILE.write_text(
+        json.dumps({"profiles": profiles, "model": model, "ts": time.time()}, ensure_ascii=False),
+        "utf-8",
+    )
+
+
+def clear_pending() -> None:
+    try:
+        PENDING_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+async def schedule_apply(bot: Bot, chat_id: int) -> None:
+    APPLY["dirty"] = True
+    task = APPLY.get("task")
+    if task is None or task.done():
+        APPLY["task"] = asyncio.create_task(apply_worker(bot, chat_id))
+
+
+async def apply_worker(bot: Bot, chat_id: int) -> None:
+    notified = False
+    while APPLY["dirty"]:
+        APPLY["dirty"] = False
+        if await asyncio.to_thread(run_control.is_active):
+            ready = await asyncio.to_thread(safe_window_ready)
+            if not ready:
+                APPLY["dirty"] = True
+                if not notified:
+                    await bot.send_message(
+                        chat_id,
+                        "⏳ Жду безопасное окно: перезагружу конфиг без остановки прогона и применю модели.",
+                    )
+                    notified = True
+                await asyncio.sleep(3)
+                continue
+        APPLY["restarting"] = True
+        try:
+            ok, message = await asyncio.to_thread(team.reload_config)
+            if not ok:
+                ok2, message2 = await asyncio.to_thread(team.restart_server_keep_auth)
+                if ok2:
+                    ok, message = True, message2
+                else:
+                    message = f"{message}; перезапуск тоже не удался: {message2}"
+        except Exception as exc:  # noqa: BLE001
+            ok, message = False, str(exc)
+        finally:
+            APPLY["restarting"] = False
+        if ok:
+            clear_pending()
+        await bot.send_message(chat_id, ("✅ " if ok else "⚠️ ") + message)
+        notified = False
+    APPLY["task"] = None
 
 
 # ------------------------------------------------------------------- questions UI
@@ -466,6 +722,9 @@ async def h_help(message: Message) -> None:
 
 @router.message(Command("newtask"))
 async def h_newtask(message: Message, command: CommandObject) -> None:
+    if APPLY["restarting"]:
+        await message.answer("Сейчас применяю модели (перезапуск сервера). Повторите через несколько секунд.")
+        return
     task = (command.args or "").strip()
     if not task:
         await message.answer("Использование: /newtask <цель задачи>")
@@ -562,8 +821,65 @@ async def h_ask(message: Message, command: CommandObject) -> None:
     await ask_secretary(message, text)
 
 
+@router.message(Command("models"))
+async def h_models(message: Message) -> None:
+    text = await asyncio.to_thread(models_text)
+    for chunk in split_text(text):
+        await message.answer(chunk)
+
+
+@router.message(Command("setmodel"))
+async def h_setmodel(message: Message, command: CommandObject) -> None:
+    parts = (command.args or "").split()
+    if len(parts) != 2:
+        await message.answer(
+            "Использование: /setmodel <target> <provider/model>\n"
+            "target: controller-plan … tester-build, secretary, controller|researcher|developer|tester, all\n"
+            "Текущие модели: /models"
+        )
+        return
+    target, model = parts
+    profiles = expand_targets(target)
+    if not profiles:
+        await message.answer(f"Неизвестная цель «{target}». Список: /models")
+        return
+    if not team.parse_model_id(model):
+        await message.answer("Модель должна быть в формате provider/model, например anymodel/glm-5.3-flash")
+        return
+    await message.answer("Проверяю модель живым запросом…")
+    ok, detail = await asyncio.to_thread(live_model_check, model)
+    if not ok:
+        await message.answer(f"❌ Модель не принята: {detail}\nКонфиг не изменён.")
+        return
+    try:
+        await asyncio.to_thread(write_model_config, profiles, model)
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(f"❌ Не удалось записать конфиг: {exc}")
+        return
+    role_profiles = [profile for profile in profiles if profile != SECRETARY_PROFILE]
+    lines = [
+        f"✅ Модель {model} принята ({detail}).",
+        "Обновлены профили: " + ", ".join(profiles) + ".",
+    ]
+    if SECRETARY_PROFILE in profiles:
+        lines.append("Секретарь перейдёт на неё со следующего сообщения.")
+    active = await asyncio.to_thread(run_control.is_active)
+    if role_profiles:
+        if active:
+            lines.append("Роли применятся со следующего хода; конфиг перезагружу в безопасном окне.")
+        else:
+            lines.append("Активного прогона нет — перезагружаю конфиг, чтобы применить везде.")
+    await message.answer("\n".join(lines))
+    if role_profiles or not active:
+        await asyncio.to_thread(mark_pending, profiles, model)
+        await schedule_apply(message.bot, message.chat.id)
+
+
 @router.callback_query(F.data.startswith("q:"))
 async def cb_question(callback: CallbackQuery) -> None:
+    if APPLY["restarting"]:
+        await callback.answer("Идёт перезапуск сервера, повторите через пару секунд", show_alert=True)
+        return
     try:
         _, qid_text, action = (callback.data or "").split(":")
         qid = int(qid_text)
@@ -592,6 +908,9 @@ async def cb_question(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.in_({"cancel:yes", "cancel:no"}))
 async def cb_cancel(callback: CallbackQuery) -> None:
+    if APPLY["restarting"]:
+        await callback.answer("Идёт перезапуск сервера, повторите через пару секунд", show_alert=True)
+        return
     if callback.data == "cancel:no":
         await callback.answer("Отмена отменена")
         if callback.message:
@@ -609,6 +928,9 @@ async def cb_cancel(callback: CallbackQuery) -> None:
 async def h_text(message: Message) -> None:
     text = (message.text or "").strip()
     if not text:
+        return
+    if APPLY["restarting"]:
+        await message.answer("Сейчас применяю модели (перезапуск сервера). Повторите через несколько секунд.")
         return
     qid = None
     if message.reply_to_message:
@@ -732,11 +1054,19 @@ async def run_bot(token: str, chat_id: int) -> None:
             BotCommand(command="questions", description="открытые вопросы"),
             BotCommand(command="answer", description="ответить на вопрос"),
             BotCommand(command="cancel", description="отменить прогон"),
+            BotCommand(command="models", description="модели агентов"),
+            BotCommand(command="setmodel", description="сменить модель агента"),
             BotCommand(command="ask", description="спросить секретаря"),
         ]
     )
 
     asyncio.create_task(progress_loop(bot, chat_id))
+    if PENDING_FILE.exists():
+        await bot.send_message(
+            chat_id,
+            "Есть неприменённые изменения моделей — применю в безопасном окне.",
+        )
+        await schedule_apply(bot, chat_id)
     await dispatcher.start_polling(bot, drop_pending_updates=True)
 
 
