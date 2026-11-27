@@ -50,6 +50,17 @@ class ModelResolutionTest(unittest.TestCase):
         team.MODEL_CACHE["mtime"] = None
 
 
+class ToolsMtimeTest(unittest.TestCase):
+    def test_tools_mtime(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="tools-"))
+        (tmp / ".opencode" / "tools").mkdir(parents=True)
+        (tmp / ".opencode" / "tools" / "x.ts").write_text("// tool")
+        (tmp / "prompts").mkdir()
+        (tmp / "prompts" / "x.md").write_text("# prompt")
+        with mock.patch.object(team, "PROJECT", tmp):
+            self.assertGreater(team.tools_mtime(), 0)
+
+
 class RestartServerTest(unittest.TestCase):
     def test_keep_auth_no_saved_server_uses_ensure(self) -> None:
         with mock.patch.object(team, "load_server", return_value=None), mock.patch.object(

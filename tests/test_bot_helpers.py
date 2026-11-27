@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import model_admin
 import team
 import team_db
 import tg_bot
@@ -69,13 +70,13 @@ class ConfigWriteTest(unittest.TestCase):
         config.write_text(
             json.dumps({"agent": {"developer-build": {"model": "anymodel/old"}}})
         )
-        original_run_dir = tg_bot.RUN_DIR
-        tg_bot.RUN_DIR = tmp
+        original_run_dir = model_admin.RUN_DIR
+        model_admin.RUN_DIR = tmp
         try:
             tg_bot.write_model_config(["developer-build", "developer-plan"],
                                       "anymodel/new", path=config)
         finally:
-            tg_bot.RUN_DIR = original_run_dir
+            model_admin.RUN_DIR = original_run_dir
         data = json.loads(config.read_text())
         self.assertEqual(data["agent"]["developer-build"]["model"], "anymodel/new")
         self.assertEqual(data["agent"]["developer-plan"]["model"], "anymodel/new")
@@ -102,6 +103,29 @@ class ConfigWriteTest(unittest.TestCase):
         self.assertIn("developer-build", text)
         self.assertIn("secretary", text)
         self.assertIn("anymodel/glm-5.3", text)
+
+
+class PendingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="pending-"))
+        self.orig = (model_admin.RUN_DIR, model_admin.PENDING_FILE)
+        model_admin.RUN_DIR = self.tmp
+        model_admin.PENDING_FILE = self.tmp / "models_pending.json"
+
+    def tearDown(self) -> None:
+        model_admin.RUN_DIR, model_admin.PENDING_FILE = self.orig
+
+    def test_roundtrip_and_text(self) -> None:
+        self.assertFalse(model_admin.pending_exists())
+        model_admin.mark_pending(["tester-plan"], "anymodel/x")
+        self.assertTrue(model_admin.pending_exists())
+        self.assertEqual(model_admin.pending_info()["model"], "anymodel/x")
+        with mock.patch.object(model_admin, "config_models", return_value={"tester-plan": "anymodel/x"}):
+            text = model_admin.models_text()
+        self.assertIn("tester-plan", text)
+        self.assertIn("неприменённое изменение", text)
+        model_admin.clear_pending()
+        self.assertFalse(model_admin.pending_exists())
 
 
 class SafeWindowTest(unittest.TestCase):

@@ -13,7 +13,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import model_admin
 import run_control
+import team
 import team_db
 
 PROJECT = Path(__file__).resolve().parent
@@ -164,6 +166,44 @@ def do_tell_controller(conn, args) -> str:
     )
 
 
+def do_models(conn, args) -> str:
+    text = model_admin.models_text()
+    if not run_control.is_active():
+        text += "\n\nАктивного прогона нет; изменения применятся при следующем запуске бота/прогона."
+    return text
+
+
+def do_setmodel(conn, args) -> str:
+    target = (args.target or "").strip()
+    model = (args.model or "").strip()
+    if not target or not model:
+        raise Reject("нужны --target и --model")
+    profiles = model_admin.expand_targets(target)
+    if not profiles:
+        raise Reject(f"неизвестная цель «{target}»")
+    if not team.parse_model_id(model):
+        raise Reject("модель должна быть в формате provider/model")
+    ok, detail = model_admin.live_check(model)
+    if not ok:
+        raise Reject(f"модель не принята: {detail}")
+    model_admin.write_config(profiles, model)
+    model_admin.mark_pending(profiles, model)
+    lines = [
+        f"Модель {model} записана для: {', '.join(profiles)}.",
+        f"Живая проверка: {detail}.",
+    ]
+    if model_admin.SECRETARY_PROFILE in profiles:
+        lines.append("Секретарь перейдёт на неё со следующего сообщения.")
+    if run_control.is_active():
+        lines.append(
+            "Применение к текущему прогону поставлено в очередь: бот перезагрузит конфиг "
+            "в безопасном окне, не останавливая прогон."
+        )
+    else:
+        lines.append("Активного прогона нет; изменение применится при следующем запуске бота/прогона.")
+    return "\n".join(lines)
+
+
 def do_result(conn, args) -> str:
     if conn is None:
         return "Финального заключения контролёра пока нет."
@@ -189,12 +229,16 @@ def run(argv: list[str]) -> int:
             "stop",
             "tell_controller",
             "result",
+            "models",
+            "setmodel",
         ],
     )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--id")
     parser.add_argument("--text")
     parser.add_argument("--task")
+    parser.add_argument("--target")
+    parser.add_argument("--model")
     args = parser.parse_args(argv)
 
     expected = secretary_session_id()
@@ -219,6 +263,8 @@ def run(argv: list[str]) -> int:
         "stop": do_stop,
         "tell_controller": do_tell_controller,
         "result": do_result,
+        "models": do_models,
+        "setmodel": do_setmodel,
     }
     handler = handlers[args.action]
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import assistant_agent
+import model_admin
 import run_control
 import team_db
 
@@ -179,6 +180,40 @@ class AssistantTest(unittest.TestCase):
             self.assertEqual(row["n"], 0)
         finally:
             conn.close()
+
+    def test_models(self) -> None:
+        with mock.patch.object(model_admin, "models_text", return_value="MODELS OK"):
+            rc, out, _ = self.call("models")
+        self.assertEqual(rc, 0)
+        self.assertIn("MODELS OK", out)
+
+    def test_setmodel_ok(self) -> None:
+        with mock.patch.object(model_admin, "live_check", return_value=(True, "anymodel/x")), \
+             mock.patch.object(model_admin, "write_config") as write, \
+             mock.patch.object(model_admin, "mark_pending") as pending, \
+             mock.patch.object(run_control, "is_active", return_value=True):
+            rc, out, _ = self.call("setmodel", "--target", "tester-plan", "--model", "anymodel/x")
+        self.assertEqual(rc, 0)
+        self.assertIn("записана", out)
+        self.assertIn("безопасном окне", out)
+        write.assert_called_once_with(["tester-plan"], "anymodel/x")
+        pending.assert_called_once_with(["tester-plan"], "anymodel/x")
+
+    def test_setmodel_bad_target_and_model(self) -> None:
+        rc, _, err = self.call("setmodel", "--target", "nope", "--model", "anymodel/x")
+        self.assertEqual(rc, 2)
+        self.assertIn("неизвестная цель", err)
+        rc, _, err = self.call("setmodel", "--target", "tester-plan", "--model", "bad")
+        self.assertEqual(rc, 2)
+        self.assertIn("provider/model", err)
+
+    def test_setmodel_rejected_by_live_check(self) -> None:
+        with mock.patch.object(model_admin, "live_check", return_value=(False, "нет модели")), \
+             mock.patch.object(model_admin, "write_config") as write:
+            rc, _, err = self.call("setmodel", "--target", "tester-plan", "--model", "anymodel/x")
+        self.assertEqual(rc, 2)
+        self.assertIn("не принята", err)
+        write.assert_not_called()
 
     def test_result(self) -> None:
         conn = team_db.connect(self.db)

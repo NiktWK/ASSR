@@ -30,6 +30,7 @@ from aiogram.types import (
     Message,
 )
 
+import model_admin
 import run_control
 import team
 import team_db
@@ -54,16 +55,17 @@ KIND_RU = {
     "accept_final": "приёмка финального результата",
     "agent": "вопрос агента",
 }
-ROLE_PROFILES = [
-    f"{role}-{phase}"
-    for role in ("controller", "researcher", "developer", "tester")
-    for phase in ("plan", "build")
-]
-SECRETARY_PROFILE = "secretary"
-ALL_MODEL_TARGETS = ROLE_PROFILES + [SECRETARY_PROFILE]
-SHORT_ROLES = ("controller", "researcher", "developer", "tester")
-PENDING_FILE = RUN_DIR / "models_pending.json"
+ROLE_PROFILES = model_admin.ROLE_PROFILES
+SECRETARY_PROFILE = model_admin.SECRETARY_PROFILE
+ALL_MODEL_TARGETS = model_admin.ALL_MODEL_TARGETS
+SHORT_ROLES = model_admin.SHORT_ROLES
+PENDING_FILE = model_admin.PENDING_FILE
 APPLY = {"dirty": False, "task": None, "restarting": False}
+expand_targets = model_admin.expand_targets
+write_model_config = model_admin.write_config
+live_model_check = model_admin.live_check
+mark_pending = model_admin.mark_pending
+clear_pending = model_admin.clear_pending
 
 router = Router()
 secretary_lock = asyncio.Lock()
@@ -395,17 +397,6 @@ async def ask_secretary(message: Message, text: str) -> None:
 
 # ------------------------------------------------------------------ model management
 
-def expand_targets(target: str) -> list[str] | None:
-    target = (target or "").strip().lower()
-    if target in ALL_MODEL_TARGETS:
-        return [target]
-    if target in SHORT_ROLES:
-        return [f"{target}-plan", f"{target}-build"]
-    if target in ("all", "*"):
-        return list(ALL_MODEL_TARGETS)
-    return None
-
-
 def _session_ids() -> dict[str, str]:
     ids: dict[str, str] = {}
     if DB_PATH.exists():
@@ -469,56 +460,6 @@ def models_text() -> str:
                 "Конфиг новее сервера: на TUI-сессиях действует кэш; /setmodel применит изменения."
             )
     return "\n".join(lines)
-
-
-def write_model_config(profiles: list[str], model: str, path: Path | None = None) -> None:
-    path = Path(path) if path else (PROJECT / "opencode.json")
-    original = path.read_text("utf-8")
-    try:
-        (RUN_DIR / "opencode.json.bak").write_text(original, "utf-8")
-    except OSError:
-        pass
-    data = json.loads(original)
-    for profile in profiles:
-        data.setdefault("agent", {}).setdefault(profile, {})["model"] = model
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", "utf-8")
-    os.replace(tmp, path)
-    team.MODEL_CACHE["mtime"] = None
-
-
-def live_model_check(model: str) -> tuple[bool, str]:
-    parsed = team.parse_model_id(model)
-    if not parsed:
-        return False, "нужен формат provider/model"
-    try:
-        client = get_client(ensure=True)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"сервер недоступен: {exc}"
-    session_id = None
-    try:
-        session_id = client.create_session("team/model-check")
-        result = client.prompt(
-            session_id,
-            "plan",
-            "Ответь ровно одним словом: ок. Не вызывай инструменты.",
-            attempts=1,
-            stall_timeout=90,
-            model=parsed,
-        )
-        info = (result or {}).get("info") or {}
-        used = f"{info.get('providerID')}/{info.get('modelID')}"
-        if info.get("error"):
-            return False, f"провайдер вернул ошибку ({used or model})"
-        return True, used or "(модель не указана в ответе)"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-    finally:
-        if session_id:
-            try:
-                client.request("DELETE", f"/session/{quote(session_id, safe='')}", timeout=30)
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _sessions_quiescent() -> bool:
@@ -588,21 +529,6 @@ def safe_window_ready() -> bool:
     return _sessions_quiescent() and _no_unconsumed_events()
 
 
-def mark_pending(profiles: list[str], model: str) -> None:
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    PENDING_FILE.write_text(
-        json.dumps({"profiles": profiles, "model": model, "ts": time.time()}, ensure_ascii=False),
-        "utf-8",
-    )
-
-
-def clear_pending() -> None:
-    try:
-        PENDING_FILE.unlink()
-    except FileNotFoundError:
-        pass
-
-
 async def schedule_apply(bot: Bot, chat_id: int) -> None:
     APPLY["dirty"] = True
     task = APPLY.get("task")
@@ -626,15 +552,22 @@ async def apply_worker(bot: Bot, chat_id: int) -> None:
                     notified = True
                 await asyncio.sleep(3)
                 continue
+        server = await asyncio.to_thread(team.load_server)
+        tools_stale = bool(server) and (
+            await asyncio.to_thread(team.tools_mtime) > float(server.get("started") or 0)
+        )
         APPLY["restarting"] = True
         try:
-            ok, message = await asyncio.to_thread(team.reload_config)
-            if not ok:
-                ok2, message2 = await asyncio.to_thread(team.restart_server_keep_auth)
-                if ok2:
-                    ok, message = True, message2
-                else:
-                    message = f"{message}; перезапуск тоже не удался: {message2}"
+            if tools_stale:
+                ok, message = await asyncio.to_thread(team.restart_server_keep_auth)
+            else:
+                ok, message = await asyncio.to_thread(team.reload_config)
+                if not ok:
+                    ok2, message2 = await asyncio.to_thread(team.restart_server_keep_auth)
+                    if ok2:
+                        ok, message = True, message2
+                    else:
+                        message = f"{message}; перезапуск тоже не удался: {message2}"
         except Exception as exc:  # noqa: BLE001
             ok, message = False, str(exc)
         finally:
@@ -709,7 +642,9 @@ async def h_start(message: Message) -> None:
         "/events [n] — последние события (метаданные)\n"
         "/questions — открытые вопросы\n"
         "/answer qN <текст> — ответить\n"
-        "/cancel — отменить прогон\n\n"
+        "/cancel — отменить прогон\n"
+        "/models — модели агентов\n"
+        "/setmodel <target> <provider/model> — сменить модель\n\n"
         "Любой обычный текст — вопрос секретарю. Он видит состояние и историю, "
         "может отвечать на вопросы, запускать/отменять прогоны и передавать указания контролёру."
     )
@@ -951,6 +886,9 @@ async def progress_loop(bot: Bot, chat_id: int) -> None:
     state = load_state()
     while True:
         try:
+            task = APPLY.get("task")
+            if model_admin.pending_exists() and (task is None or task.done()) and not APPLY["restarting"]:
+                await schedule_apply(bot, chat_id)
             snapshot = await asyncio.to_thread(db_snapshot, int(state.get("last_event_id") or 0))
             await apply_snapshot(bot, chat_id, state, snapshot)
         except Exception:  # noqa: BLE001 - keep the bot alive

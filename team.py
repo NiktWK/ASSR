@@ -306,6 +306,19 @@ def agent_config_models() -> dict[str, str]:
     return dict(MODEL_CACHE.get("models") or {})
 
 
+def tools_mtime() -> float:
+    """Newest mtime of custom tools/prompts; they require a server process restart."""
+    files = []
+    tools_dir = PROJECT / ".opencode" / "tools"
+    if tools_dir.is_dir():
+        files.extend(tools_dir.glob("*.ts"))
+    prompts = PROJECT / "prompts"
+    if prompts.is_dir():
+        files.extend(prompts.glob("*.md"))
+    stamps = [f.stat().st_mtime for f in files if f.exists()]
+    return max(stamps) if stamps else 0.0
+
+
 def agent_profile_model(profile: str) -> dict | None:
     return parse_model_id(agent_config_models().get(profile))
 
