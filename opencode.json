@@ -86,7 +86,7 @@
     "developer-build": {
       "mode": "primary",
       "description": "Разработчик: код и unit-тесты (BUILD)",
-      "model": "anymodel/glm-5.3",
+      "model": "anymodel/ds/deepseek-v4.1-flash",
       "prompt": "{file:./prompts/developer-build.md}",
       "permission": {
         "*": "deny",
