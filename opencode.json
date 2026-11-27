@@ -1,0 +1,163 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "controller-plan": {
+      "mode": "primary",
+      "description": "Контролёр: директива и критерии (PLAN)",
+      "model": "anymodel/glm-5.3",
+      "prompt": "{file:./prompts/controller-plan.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "team": "allow"
+      }
+    },
+    "controller-build": {
+      "mode": "primary",
+      "description": "Контролёр: критика процесса исследователя (BUILD)",
+      "model": "anymodel/glm-5.3",
+      "prompt": "{file:./prompts/controller-build.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "team": "allow"
+      }
+    },
+    "researcher-plan": {
+      "mode": "primary",
+      "description": "Исследователь: источники, декомпозиция, архитектура (PLAN)",
+      "model": "anymodel/glm-5.3",
+      "prompt": "{file:./prompts/researcher-plan.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "webfetch": "allow",
+        "team": "allow",
+        "bash": {
+          "*": "deny",
+          "python3 tools/websearch.py *": "allow",
+          "python3 ./tools/websearch.py *": "allow"
+        }
+      }
+    },
+    "researcher-build": {
+      "mode": "primary",
+      "description": "Исследователь: координация разработчика и тестировщика (BUILD)",
+      "model": "anymodel/glm-5.3",
+      "prompt": "{file:./prompts/researcher-build.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "webfetch": "allow",
+        "team": "allow",
+        "bash": {
+          "*": "deny",
+          "python3 tools/websearch.py *": "allow",
+          "python3 ./tools/websearch.py *": "allow"
+        }
+      }
+    },
+    "developer-plan": {
+      "mode": "primary",
+      "description": "Разработчик: план реализации (PLAN)",
+      "model": "anymodel/glm-5.3",
+      "prompt": "{file:./prompts/developer-plan.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "team": "allow"
+      }
+    },
+    "developer-build": {
+      "mode": "primary",
+      "description": "Разработчик: код и unit-тесты (BUILD)",
+      "model": "anymodel/ds/deepseek-v4.1-flash",
+      "prompt": "{file:./prompts/developer-build.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": {
+          "*": "deny",
+          "workspace/**": "allow",
+          "**/workspace/**": "allow",
+          "./workspace/**": "allow"
+        },
+        "bash": "allow",
+        "team": "allow"
+      }
+    },
+    "tester-plan": {
+      "mode": "primary",
+      "description": "Тестировщик: план проверки по существу (PLAN)",
+      "model": "anymodel/glm-5.3-flash",
+      "prompt": "{file:./prompts/tester-plan.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "team": "allow"
+      }
+    },
+    "tester-build": {
+      "mode": "primary",
+      "description": "Тестировщик: прогоны и отчёт (BUILD)",
+      "model": "anymodel/ds/deepseek-v4.1-flash",
+      "prompt": "{file:./prompts/tester-build.md}",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": {
+          "*": "deny",
+          "workspace/**": "allow",
+          "**/workspace/**": "allow",
+          "./workspace/**": "allow"
+        },
+        "bash": "allow",
+        "team": "allow"
+      }
+    },
+    "secretary": {
+      "mode": "primary",
+      "description": "Секретарь оператора: состояние, вопросы, запуск/отмена, указания контролёру",
+      "model": "anymodel/am/nemotron-3-ultra-550b-a55b",
+      "prompt": "{file:./prompts/secretary.md}",
+      "permission": {
+        "*": "deny",
+        "read": {
+          "*": "allow",
+          "run/telegram.json": "deny",
+          "**/run/telegram.json": "deny",
+          "run/server.json": "deny",
+          "**/run/server.json": "deny"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "assistant": "allow"
+      }
+    }
+  }
+}
