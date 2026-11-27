@@ -16,10 +16,22 @@ import team_db
 
 PROJECT = Path(__file__).resolve().parent
 RUN_DIR = PROJECT / "run"
+RUNS_DIR = RUN_DIR / "runs"
 PID_FILE = RUN_DIR / "orchestrator.pid"
 CANCEL_FILE = RUN_DIR / "cancel"
 LOCK_FILE = RUN_DIR / "start.lock"
-CONSOLE_FILE = RUN_DIR / "console.log"
+CONSOLE_FILE = RUN_DIR / "console.log"  # legacy location; new runs use run/runs/<tag>/
+
+
+def target_run_dir(resume_tag: str | None = None) -> Path:
+    """Directory of the run to (re)start: explicit tag, else current pointer/legacy."""
+    if resume_tag:
+        return RUNS_DIR / resume_tag
+    return team_db.current_run_dir()
+
+
+def _console_file(run_dir: Path) -> Path:
+    return run_dir / "console.log"
 
 
 class RunBusy(Exception):
@@ -67,22 +79,40 @@ def run_tag() -> str:
         conn.close()
 
 
-def start_run(task: str) -> dict:
+def start_run(task: str, resume: bool = False, resume_tag: str | None = None) -> dict:
     task = (task or "").strip()
-    if not task:
+    if not resume and not task:
         raise RunError("пустая задача")
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     with open(LOCK_FILE, "w", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if is_active():
             raise RunBusy("прогон уже выполняется")
-        with open(CONSOLE_FILE, "ab") as console:
+        if resume:
+            run_dir = target_run_dir(resume_tag)
+            if not (run_dir / "state.db").exists():
+                raise RunError("нечего продолжать: сохранённый прогон не найден")
+            run_tag = resume_tag or run_dir.name
+        else:
+            run_tag = time.strftime("%Y%m%d-%H%M%S")
+            run_dir = RUNS_DIR / run_tag
+        run_dir.mkdir(parents=True, exist_ok=True)
+        console_path = _console_file(run_dir)
+        with open(console_path, "ab") as console:
+            label = "resume" if resume else "start"
             console.write(
-                f"\n\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} start: {task}\n".encode()
+                f"\n\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {label}: {task or '(saved run)'}\n".encode()
             )
             console.flush()
+            command = [sys.executable, str(PROJECT / "team.py"), "run"]
+            if resume:
+                command.append("--resume")
+                if resume_tag:
+                    command.append(resume_tag)
+            else:
+                command += ["--fresh", "--run-tag", run_tag, task]
             proc = subprocess.Popen(
-                [sys.executable, str(PROJECT / "team.py"), "run", task],
+                command,
                 cwd=str(PROJECT),
                 stdout=console,
                 stderr=subprocess.STDOUT,
@@ -91,19 +121,24 @@ def start_run(task: str) -> dict:
         deadline = time.time() + 20
         while time.time() < deadline:
             if is_active():
-                return {"pid": proc.pid, "run_tag": run_tag()}
+                return {"pid": proc.pid, "run_tag": run_tag, "run_dir": str(run_dir)}
             if proc.poll() is not None:
-                tail = _log_tail()
+                tail = _log_tail(path=console_path)
                 raise RunError(
                     f"оркестратор завершился при старте (код {proc.returncode}).\n{tail}"
                 )
             time.sleep(0.3)
-        raise RunError("оркестратор не стартовал за 20 секунд; смотри run/console.log")
+        raise RunError(f"оркестратор не стартовал за 20 секунд; смотри {console_path}")
 
 
-def _log_tail(limit: int = 2000) -> str:
+def resume_run(run_tag: str | None = None) -> dict:
+    """Continue a saved run (default: the current one). Same sessions, no reset."""
+    return start_run("", resume=True, resume_tag=run_tag)
+
+
+def _log_tail(limit: int = 2000, path: Path | None = None) -> str:
     try:
-        return CONSOLE_FILE.read_text("utf-8", "replace")[-limit:]
+        return (path or CONSOLE_FILE).read_text("utf-8", "replace")[-limit:]
     except OSError:
         return ""
 

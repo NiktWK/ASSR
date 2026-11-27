@@ -8,8 +8,10 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.error import URLError
 
 import team
+import team_db
 
 
 class ModelResolutionTest(unittest.TestCase):
@@ -59,6 +61,72 @@ class ToolsMtimeTest(unittest.TestCase):
         (tmp / "prompts" / "x.md").write_text("# prompt")
         with mock.patch.object(team, "PROJECT", tmp):
             self.assertGreater(team.tools_mtime(), 0)
+
+
+class RequestErrorTest(unittest.TestCase):
+    def test_timeout_becomes_retryable_opencode_error(self) -> None:
+        client = team.OpenCode("http://127.0.0.1:1", timeout=5)
+        with mock.patch.object(team, "urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(team.OpenCodeError) as ctx:
+                client.request("GET", "/config", timeout=1)
+        self.assertTrue(ctx.exception.retryable)
+        self.assertIsNone(ctx.exception.status)
+
+    def test_urlerror_is_retryable(self) -> None:
+        client = team.OpenCode("http://127.0.0.1:1", timeout=5)
+        with mock.patch.object(team, "urlopen", side_effect=URLError("connection refused")):
+            with self.assertRaises(team.OpenCodeError) as ctx:
+                client.request("GET", "/config", timeout=1)
+        self.assertTrue(ctx.exception.retryable)
+
+
+class PromptRetryTest(unittest.TestCase):
+    def test_retries_on_retryable_network_error(self) -> None:
+        client = team.OpenCode("http://127.0.0.1:1", timeout=5)
+        calls = {"n": 0}
+
+        def fake_request(method, path, body=None, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise team.OpenCodeError("сеть: timed out", retryable=True)
+            return {"info": {}, "parts": [{"type": "text", "text": "ok"}]}
+
+        client.request = fake_request
+        client.messages = lambda session_id: []
+        with mock.patch.object(team.time, "sleep"):
+            result = client.prompt("sid", "developer-build", "hi", attempts=3, stall_timeout=0)
+        self.assertEqual(team.extract_text(result), "ok")
+        self.assertEqual(calls["n"], 2)
+
+
+class LoadSessionsTest(unittest.TestCase):
+    def _db(self):
+        tmp = Path(tempfile.mkdtemp(prefix="loadsess-"))
+        db = tmp / "state.db"
+        team_db.init(db)
+        return db
+
+    def test_loads_all_roles(self) -> None:
+        db = self._db()
+        conn = team_db.connect(db)
+        try:
+            for role in team.ROLES:
+                team_db.set_session(conn, role, f"ses_{role}")
+            sessions = team.load_sessions(conn)
+        finally:
+            conn.close()
+        self.assertEqual(set(sessions), set(team.ROLES))
+        self.assertEqual(sessions["developer"], "ses_developer")
+
+    def test_missing_role_raises(self) -> None:
+        db = self._db()
+        conn = team_db.connect(db)
+        try:
+            team_db.set_session(conn, "controller", "x")
+            with self.assertRaises(SystemExit):
+                team.load_sessions(conn)
+        finally:
+            conn.close()
 
 
 class RestartServerTest(unittest.TestCase):

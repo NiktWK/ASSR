@@ -15,7 +15,6 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote
 from urllib.request import urlopen
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -37,7 +36,6 @@ import team_db
 
 PROJECT = Path(__file__).resolve().parent
 RUN_DIR = PROJECT / "run"
-DB_PATH = RUN_DIR / "state.db"
 STATE_FILE = RUN_DIR / "bot_state.json"
 SECRETARY_FILE = RUN_DIR / "secretary.json"
 CONFIG_FILE = RUN_DIR / "telegram.json"
@@ -148,9 +146,9 @@ def split_text(text: str, limit: int = MAX_LEN) -> list[str]:
 # --------------------------------------------------------------------- db helpers
 
 def db_snapshot(last_event_id: int) -> dict:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return {"no_db": True, "active": run_control.is_active()}
-    conn = team_db.connect(DB_PATH)
+    conn = team_db.connect(team_db.db_path())
     try:
         tag = team_db.get_meta(conn, "run_tag", "") or ""
         status = team_db.get_meta(conn, "run_status", "?") or "?"
@@ -176,14 +174,14 @@ def db_snapshot(last_event_id: int) -> dict:
 
 
 def status_text() -> str:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return (
             "Прогона ещё нет.\n"
             "Запустить: /newtask <цель>\n"
             "Или спросите секретаря обычным текстом."
         )
     try:
-        conn = team_db.connect(DB_PATH)
+        conn = team_db.connect(team_db.db_path())
     except sqlite3.Error:
         return "База состояния сейчас обновляется. Повторите через секунду."
     try:
@@ -218,10 +216,10 @@ def status_text() -> str:
 
 
 def tasks_text() -> str:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return "Задач нет."
     try:
-        conn = team_db.connect(DB_PATH)
+        conn = team_db.connect(team_db.db_path())
         try:
             rows = team_db.list_tasks(conn)
         finally:
@@ -236,10 +234,10 @@ def tasks_text() -> str:
 
 
 def events_text(limit: int) -> str:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return "Событий нет."
     try:
-        conn = team_db.connect(DB_PATH)
+        conn = team_db.connect(team_db.db_path())
         try:
             rows = team_db.recent_events(conn, limit)
         finally:
@@ -253,10 +251,10 @@ def events_text(limit: int) -> str:
 
 def open_human_questions():
     """None means the DB is not readable right now."""
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return []
     try:
-        conn = team_db.connect(DB_PATH)
+        conn = team_db.connect(team_db.db_path())
         try:
             return team_db.open_questions(conn, "human")
         finally:
@@ -266,10 +264,10 @@ def open_human_questions():
 
 
 def answer_human(qid, text: str) -> tuple[bool, str]:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return False, "Нет активного прогона."
     try:
-        conn = team_db.connect(DB_PATH)
+        conn = team_db.connect(team_db.db_path())
     except sqlite3.Error:
         return False, "База состояния сейчас обновляется. Повторите через секунду."
     try:
@@ -399,9 +397,9 @@ async def ask_secretary(message: Message, text: str) -> None:
 
 def _session_ids() -> dict[str, str]:
     ids: dict[str, str] = {}
-    if DB_PATH.exists():
+    if team_db.db_path().exists():
         try:
-            conn = team_db.connect(DB_PATH)
+            conn = team_db.connect(team_db.db_path())
             try:
                 ids = {
                     row["role"]: row["session_id"]
@@ -463,7 +461,7 @@ def models_text() -> str:
 
 
 def _sessions_quiescent() -> bool:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return True
     try:
         client = get_client(ensure=False)
@@ -485,10 +483,10 @@ def _sessions_quiescent() -> bool:
 
 
 def _no_unconsumed_events() -> bool:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return True
     try:
-        conn = team_db.connect(DB_PATH)
+        conn = team_db.connect(team_db.db_path())
         try:
             row = conn.execute("SELECT COUNT(*) AS n FROM events WHERE consumed=0").fetchone()
             return int(row["n"]) == 0
@@ -499,10 +497,10 @@ def _no_unconsumed_events() -> bool:
 
 
 def _open_human_question() -> bool:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return False
     try:
-        conn = team_db.connect(DB_PATH)
+        conn = team_db.connect(team_db.db_path())
         try:
             return bool(team_db.open_questions(conn, "human"))
         finally:
@@ -536,26 +534,51 @@ async def schedule_apply(bot: Bot, chat_id: int) -> None:
         APPLY["task"] = asyncio.create_task(apply_worker(bot, chat_id))
 
 
+def apply_action(active: bool, tools_stale: bool) -> str:
+    """Decide how to apply a pending model change.
+
+    - "reload": no active run -> safe to reload/restart the server now.
+    - "per_turn": run active, only models changed -> the orchestrator resolves models
+      per turn from opencode.json (per-message override); no server action needed.
+    - "defer": run active and tools/prompts changed -> a process restart is required
+      but would cut an in-flight turn and crash the orchestrator; wait for the run.
+    """
+    if not active:
+        return "reload"
+    return "defer" if tools_stale else "per_turn"
+
+
 async def apply_worker(bot: Bot, chat_id: int) -> None:
     notified = False
     while APPLY["dirty"]:
         APPLY["dirty"] = False
-        if await asyncio.to_thread(run_control.is_active):
-            ready = await asyncio.to_thread(safe_window_ready)
-            if not ready:
-                APPLY["dirty"] = True
-                if not notified:
-                    await bot.send_message(
-                        chat_id,
-                        "⏳ Жду безопасное окно: перезагружу конфиг без остановки прогона и применю модели.",
-                    )
-                    notified = True
-                await asyncio.sleep(3)
-                continue
+        active = await asyncio.to_thread(run_control.is_active)
         server = await asyncio.to_thread(team.load_server)
         tools_stale = bool(server) and (
             await asyncio.to_thread(team.tools_mtime) > float(server.get("started") or 0)
         )
+        action = apply_action(active, tools_stale)
+        if action == "defer":
+            # Never restart/reload the server while a turn may be in flight: it cuts
+            # the turn and crashes the orchestrator. Wait until the run finishes.
+            APPLY["dirty"] = True
+            if not notified:
+                await bot.send_message(
+                    chat_id,
+                    "⏳ Правка затрагивает инструменты — сервер нельзя трогать на ходу. "
+                    "Применю после завершения прогона.",
+                )
+                notified = True
+            await asyncio.sleep(3)
+            continue
+        if action == "per_turn":
+            clear_pending()
+            await bot.send_message(
+                chat_id,
+                "✅ Модели из конфига применятся со следующего хода агентов (без перезапуска).",
+            )
+            notified = False
+            continue
         APPLY["restarting"] = True
         try:
             if tools_stale:
@@ -637,6 +660,7 @@ async def h_start(message: Message) -> None:
         "Команда AutomateML на связи.\n\n"
         "Управление:\n"
         "/newtask <цель> — запустить прогон\n"
+        "/resume [тег] — продолжить сохранённый прогон\n"
         "/status — состояние\n"
         "/tasks — задачи\n"
         "/events [n] — последние события (метаданные)\n"
@@ -680,6 +704,29 @@ async def h_newtask(message: Message, command: CommandObject) -> None:
     )
 
 
+@router.message(Command("resume"))
+async def h_resume(message: Message, command: CommandObject) -> None:
+    if APPLY["restarting"]:
+        await message.answer("Сейчас применяю модели (перезапуск сервера). Повторите через несколько секунд.")
+        return
+    if run_control.is_active():
+        await message.answer("Прогон уже выполняется — продолжать нечего.")
+        return
+    tag = (command.args or "").strip() or None
+    try:
+        result = await asyncio.to_thread(run_control.resume_run, tag)
+    except run_control.RunBusy:
+        await message.answer("Прогон уже выполняется.")
+        return
+    except run_control.RunError as exc:
+        await message.answer(f"Не удалось продолжить: {exc}")
+        return
+    await message.answer(
+        f"▶️ Продолжаю сохранённый прогон {result.get('run_tag')} "
+        f"(pid {result.get('pid')})."
+    )
+
+
 @router.message(Command("status"))
 async def h_status(message: Message) -> None:
     text = await asyncio.to_thread(status_text)
@@ -713,7 +760,7 @@ async def h_questions(message: Message) -> None:
         await message.answer("База состояния сейчас обновляется. Повторите через секунду.")
         return
     if not rows:
-        await message.answer("Открытых вопросов нет" if DB_PATH.exists() else "Активного прогона нет.")
+        await message.answer("Открытых вопросов нет" if team_db.db_path().exists() else "Активного прогона нет.")
         return
     for question in rows:
         await send_question(message.bot, message.chat.id, question)
@@ -954,6 +1001,11 @@ async def apply_snapshot(bot: Bot, chat_id: int, state: dict, snapshot: dict) ->
     if status in ("done", "cancelled") and previous == "running":
         note = "🏁 Прогон завершён." if status == "done" else "🛑 Прогон отменён."
         await bot.send_message(chat_id, note)
+    if status == "failed" and previous == "running":
+        await bot.send_message(
+            chat_id,
+            "💥 Прогон упал (ошибка оркестратора). Подробности в run/console.log.",
+        )
     if status == "running" and not snapshot.get("active") and previous == "running":
         await bot.send_message(
             chat_id,
@@ -986,6 +1038,7 @@ async def run_bot(token: str, chat_id: int) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="newtask", description="запустить прогон"),
+            BotCommand(command="resume", description="продолжить сохранённый прогон"),
             BotCommand(command="status", description="состояние"),
             BotCommand(command="tasks", description="задачи"),
             BotCommand(command="events", description="последние события"),

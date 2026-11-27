@@ -1,6 +1,7 @@
 """Tests for pure Telegram-bot helpers and shared DB helpers."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -142,6 +143,56 @@ class SafeWindowTest(unittest.TestCase):
             self.assertTrue(tg_bot.safe_window_ready())
 
 
+class ApplyActionTest(unittest.TestCase):
+    def test_no_active_run_reloads(self) -> None:
+        self.assertEqual(tg_bot.apply_action(False, False), "reload")
+        self.assertEqual(tg_bot.apply_action(False, True), "reload")
+
+    def test_active_model_only_is_per_turn(self) -> None:
+        self.assertEqual(tg_bot.apply_action(True, False), "per_turn")
+
+    def test_active_tools_changed_defers(self) -> None:
+        self.assertEqual(tg_bot.apply_action(True, True), "defer")
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send_message(self, chat_id: int, text: str) -> None:
+        self.sent.append(text)
+
+
+class ApplyWorkerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig = dict(tg_bot.APPLY)
+
+    def tearDown(self) -> None:
+        tg_bot.APPLY.clear()
+        tg_bot.APPLY.update(self._orig)
+
+    def test_model_only_during_run_clears_pending_without_restart(self) -> None:
+        tg_bot.APPLY.update({"dirty": True, "task": None, "restarting": False})
+        bot = FakeBot()
+        cleared = {"n": 0}
+        with mock.patch.object(tg_bot.run_control, "is_active", return_value=True),              mock.patch.object(tg_bot.team, "load_server", return_value={"started": 100.0}),              mock.patch.object(tg_bot.team, "tools_mtime", return_value=1.0),              mock.patch.object(tg_bot, "clear_pending",                                side_effect=lambda: cleared.__setitem__("n", cleared["n"] + 1)),              mock.patch.object(tg_bot.team, "reload_config") as reload_mock,              mock.patch.object(tg_bot.team, "restart_server_keep_auth") as restart_mock:
+            asyncio.run(tg_bot.apply_worker(bot, 1))
+        self.assertEqual(cleared["n"], 1)
+        reload_mock.assert_not_called()
+        restart_mock.assert_not_called()
+        self.assertTrue(any("следующего хода" in s for s in bot.sent))
+
+    def test_inactive_run_reloads_server(self) -> None:
+        tg_bot.APPLY.update({"dirty": True, "task": None, "restarting": False})
+        bot = FakeBot()
+        cleared = {"n": 0}
+        with mock.patch.object(tg_bot.run_control, "is_active", return_value=False),              mock.patch.object(tg_bot.team, "load_server", return_value={"started": 100.0}),              mock.patch.object(tg_bot.team, "tools_mtime", return_value=1.0),              mock.patch.object(tg_bot, "clear_pending",                                side_effect=lambda: cleared.__setitem__("n", cleared["n"] + 1)),              mock.patch.object(tg_bot.team, "reload_config",                                return_value=(True, "ok")) as reload_mock,              mock.patch.object(tg_bot.team, "restart_server_keep_auth") as restart_mock:
+            asyncio.run(tg_bot.apply_worker(bot, 1))
+        self.assertEqual(cleared["n"], 1)
+        reload_mock.assert_called_once()
+        restart_mock.assert_not_called()
+
+
 class SplitTextTest(unittest.TestCase):
     def test_short_text_single_chunk(self) -> None:
         self.assertEqual(tg_bot.split_text("привет"), ["привет"])
@@ -233,11 +284,14 @@ class AnswerHumanTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="botdb-"))
         self.db = self.tmp / "state.db"
         team_db.init(self.db)
-        self.orig = tg_bot.DB_PATH
-        tg_bot.DB_PATH = self.db
+        self.old_env = os.environ.get("TEAM_DB")
+        os.environ["TEAM_DB"] = str(self.db)
 
     def tearDown(self) -> None:
-        tg_bot.DB_PATH = self.orig
+        if self.old_env is None:
+            os.environ.pop("TEAM_DB", None)
+        else:
+            os.environ["TEAM_DB"] = self.old_env
 
     def test_answer_human(self) -> None:
         conn = team_db.connect(self.db)

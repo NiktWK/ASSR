@@ -20,7 +20,6 @@ import team_db
 
 PROJECT = Path(__file__).resolve().parent
 RUN_DIR = PROJECT / "run"
-DB_PATH = RUN_DIR / "state.db"
 SECRETARY_FILE = RUN_DIR / "secretary.json"
 
 
@@ -36,15 +35,15 @@ def secretary_session_id() -> str | None:
 
 
 def _open_db() -> sqlite3.Connection:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         raise Reject("нет базы прогона: сначала запустите задачу (/newtask)")
-    return team_db.connect(DB_PATH)
+    return team_db.connect(team_db.db_path())
 
 
 def _run_status() -> tuple[str, str, str]:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return "нет прогона", "", ""
-    conn = team_db.connect(DB_PATH)
+    conn = team_db.connect(team_db.db_path())
     try:
         status = team_db.get_meta(conn, "run_status", "?") or "?"
         tag = team_db.get_meta(conn, "run_tag", "") or ""
@@ -55,7 +54,7 @@ def _run_status() -> tuple[str, str, str]:
 
 
 def do_status(conn, args) -> str:
-    if not DB_PATH.exists():
+    if not team_db.db_path().exists():
         return (
             "Активного прогона нет.\n"
             f"Оркестратор запущен: {'да' if run_control.is_active() else 'нет'}."
@@ -281,7 +280,7 @@ def run(argv: list[str]) -> int:
         if needs_db:
             conn = _open_db()
         else:
-            conn = team_db.connect(DB_PATH) if DB_PATH.exists() else None
+            conn = team_db.connect(team_db.db_path()) if team_db.db_path().exists() else None
         print(handler(conn, args))
         return 0
     except (Reject, ValueError) as exc:

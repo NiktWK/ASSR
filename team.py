@@ -24,6 +24,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -38,6 +39,8 @@ import team_db
 
 PROJECT = Path(__file__).resolve().parent
 RUN_DIR = PROJECT / "run"
+RUNS_DIR = RUN_DIR / "runs"
+POINTER_FILE = RUN_DIR / "current.json"
 SERVER_FILE = RUN_DIR / "server.json"
 LOG_FILE = RUN_DIR / "events.log"
 CHAT_DIR = RUN_DIR / "chat"
@@ -72,10 +75,17 @@ def is_approval(text: str) -> bool:
 # --------------------------------------------------------------------- opencode HTTP
 
 class OpenCodeError(Exception):
-    def __init__(self, message: str, status: int | None = None, body: str = ""):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        body: str = "",
+        retryable: bool = False,
+    ):
         super().__init__(message)
         self.status = status
         self.body = body
+        self.retryable = retryable
 
 
 class RunCancelled(Exception):
@@ -109,7 +119,10 @@ class OpenCode:
                 f"HTTP {exc.code} {path}", status=exc.code, body=raw.decode("utf-8", "replace")
             ) from None
         except URLError as exc:
-            raise OpenCodeError(f"сеть: {exc.reason}") from None
+            raise OpenCodeError(f"сеть: {exc.reason}", retryable=True) from None
+        except (TimeoutError, OSError) as exc:
+            # socket.timeout / ConnectionReset / server restarting: transient network error.
+            raise OpenCodeError(f"сеть: {exc}", retryable=True) from None
         if not raw:
             return None
         try:
@@ -194,7 +207,7 @@ class OpenCode:
                 exc = holder["error"]
                 if isinstance(exc, OpenCodeError):
                     last_error = exc
-                    if exc.status in (429, 500, 502, 503) and attempt < attempts:
+                    if (exc.retryable or exc.status in (429, 500, 502, 503)) and attempt < attempts:
                         time.sleep(5 * attempt)
                         continue
                 raise exc
@@ -345,7 +358,9 @@ def _spawn_server(port: int, password: str) -> subprocess.Popen:
     log = open(RUN_DIR / "server.log", "ab")
     env = os.environ.copy()
     env["OPENCODE_SERVER_PASSWORD"] = password
-    env["TEAM_DB"] = str(DB_PATH)
+    # The state DB is resolved dynamically (run/current.json) so a reused server
+    # always sees the active run; never bake a run-specific path into the env.
+    env.pop("TEAM_DB", None)
     return subprocess.Popen(
         ["opencode", "serve", "--hostname", "127.0.0.1", "--port", str(port)],
         cwd=str(PROJECT),
@@ -655,20 +670,23 @@ class Orchestrator:
         )
 
     # -- lifecycle -------------------------------------------------------
-    def run(self) -> None:
+    def run(self, resume: bool = False) -> None:
         team_db.set_meta(self.conn, "run_status", "running")
-        team_db.set_meta(self.conn, "task", self.task)
-        self.log(f"СТАРТ: {self.task}")
-        message = (
-            f"{self.task_header()}\n\n"
-            "Ты — контролёр, фаза PLAN. Сформулируй директиву для исследователя: цель, "
-            "критерии приёмки, ограничения, риски. Когда директива готова, вызови "
-            'team submit с phase="plan" и полным текстом директивы.'
-        )
-        self.send("controller", "plan", message)
+        if not resume:
+            team_db.set_meta(self.conn, "task", self.task)
+            self.log(f"СТАРТ: {self.task}")
+            message = (
+                f"{self.task_header()}\n\n"
+                "Ты — контролёр, фаза PLAN. Сформулируй директиву для исследователя: цель, "
+                "критерии приёмки, ограничения, риски. Когда директива готова, вызови "
+                'team submit с phase="plan" и полным текстом директивы.'
+            )
+            self.send("controller", "plan", message)
+        else:
+            self.log(f"ПРОДОЛЖЕНИЕ: {self.task}")
 
         while team_db.get_meta(self.conn, "run_status", "running") == "running":
-            if (self.run_dir / "cancel").exists():
+            if CANCEL_FILE.exists():
                 self.log("получена команда отмены — прерываю сессии")
                 team_db.set_meta(self.conn, "run_status", "cancelled")
                 for session_id in self.sessions.values():
@@ -680,7 +698,9 @@ class Orchestrator:
                 continue
             self.handle_event(event)
             team_db.consume_event(self.conn, event["id"])
+            backup_state(self.conn, self.run_dir)
 
+        backup_state(self.conn, self.run_dir)
         if team_db.get_meta(self.conn, "run_status") == "cancelled":
             self.log("ПРОГОН ОТМЕНЁН. Сессии оставлены открытыми для просмотра.")
         else:
@@ -1021,20 +1041,160 @@ class Orchestrator:
 
 # ------------------------------------------------------------------------ helpers
 
-def reset_run_state() -> None:
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            (RUN_DIR / f"state.db{suffix}").unlink()
-        except FileNotFoundError:
-            pass
+# --------------------------------------------------------------------- run dirs
+
+def read_pointer() -> dict:
     try:
-        LOG_FILE.unlink()
-    except FileNotFoundError:
-        pass
+        data = json.loads(POINTER_FILE.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_pointer(run_tag: str, run_dir: Path) -> None:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        rel = str(run_dir.resolve().relative_to(RUN_DIR.resolve()))
+    except ValueError:
+        rel = str(run_dir)
+    data = {"run_tag": run_tag, "dir": rel, "updated": time.time()}
+    tmp = POINTER_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, POINTER_FILE)
+
+
+def new_run_dir(run_tag: str) -> Path:
+    run_dir = RUNS_DIR / run_tag
+    (run_dir / "chat").mkdir(parents=True, exist_ok=True)
+    team_db.init(run_dir / "state.db")
+    return run_dir
+
+
+def migrate_legacy_run() -> str | None:
+    """Move a pre-per-run state (run/state.db, chat/, events.log) into run/runs/<tag>/.
+
+    Nothing is deleted: the legacy run becomes a first-class, resumable run directory.
+    """
+    legacy_db = RUN_DIR / "state.db"
+    if not legacy_db.exists() and not CHAT_DIR.exists() and not LOG_FILE.exists():
+        return None
+    tag = ""
+    if legacy_db.exists():
+        try:
+            conn = team_db.connect(legacy_db)
+            try:
+                tag = team_db.get_meta(conn, "run_tag", "") or ""
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            tag = ""
+    tag = tag or time.strftime("%Y%m%d-%H%M%S")
+    dest = RUNS_DIR / tag
+    n = 2
+    while dest.exists():
+        dest = RUNS_DIR / f"{tag}-{n}"
+        n += 1
+    (dest / "chat").mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        src = Path(str(legacy_db) + suffix)
+        if src.exists():
+            shutil.move(str(src), str(dest / src.name))
+    if LOG_FILE.exists():
+        shutil.move(str(LOG_FILE), str(dest / LOG_FILE.name))
     if CHAT_DIR.exists():
-        shutil.rmtree(CHAT_DIR)
-    CHAT_DIR.mkdir(parents=True, exist_ok=True)
-    team_db.init(DB_PATH)
+        for item in CHAT_DIR.iterdir():
+            shutil.move(str(item), str(dest / "chat" / item.name))
+        try:
+            CHAT_DIR.rmdir()  # only when fully emptied; never delete leftovers
+        except OSError:
+            pass
+    console = RUN_DIR / "console.log"
+    if console.exists():
+        try:
+            shutil.copy2(str(console), str(dest / "console.log"))
+        except OSError:
+            pass
+    if not (dest / "state.db").exists():
+        team_db.init(dest / "state.db")
+    write_pointer(tag, dest)
+    return tag
+
+
+def write_run_manifest(run_dir: Path, run_tag: str, task: str, sessions: dict) -> None:
+    data = {
+        "run_tag": run_tag,
+        "task": task,
+        "updated": time.time(),
+        "sessions": dict(sessions),
+    }
+    tmp = run_dir / "sessions.json.tmp"
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, run_dir / "sessions.json")
+
+
+def load_run_manifest(run_dir: Path) -> dict:
+    try:
+        data = json.loads((run_dir / "sessions.json").read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def backup_state(conn, run_dir: Path, keep: int = 10) -> Path | None:
+    """Best-effort SQLite backup of the run state; must never raise."""
+    try:
+        backups = run_dir / "backups"
+        backups.mkdir(parents=True, exist_ok=True)
+        dest = backups / f"state-{int(time.time() * 1000):013d}.db"
+        bconn = sqlite3.connect(str(dest))
+        try:
+            conn.backup(bconn)
+        finally:
+            bconn.close()
+        files = sorted(backups.glob("state-*.db"))
+        if keep > 0:
+            for old in files[:-keep]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        return dest
+    except Exception:  # noqa: BLE001 - backups must never break a run
+        return None
+
+
+def has_saved_run() -> bool:
+    return POINTER_FILE.exists() or DB_PATH.exists()
+
+
+def new_run_blocker(fresh: bool) -> str | None:
+    """A reason to refuse starting a new run, or None when it is allowed."""
+    import run_control
+
+    if run_control.is_active():
+        return (
+            "прогон уже выполняется — сначала отмените его (team.py cancel) "
+            "или дождитесь завершения"
+        )
+    if not fresh and has_saved_run():
+        return (
+            "есть сохранённый прогон. Продолжить: team.py run --resume [тег]; "
+            'начать новый: team.py run --fresh "<задача>"'
+        )
+    return None
+
+
+def mark_run_failed(db_path: Path | None = None) -> None:
+    """Flag a crashed run so the bot stops reporting a stale 'running' status."""
+    try:
+        conn = team_db.connect(db_path or team_db.db_path())
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        if team_db.get_meta(conn, "run_status", "") == "running":
+            team_db.set_meta(conn, "run_status", "failed")
+    finally:
+        conn.close()
 
 
 def create_sessions(client: OpenCode, run_tag: str) -> dict[str, str]:
@@ -1042,6 +1202,17 @@ def create_sessions(client: OpenCode, run_tag: str) -> dict[str, str]:
     for role in ROLES:
         title = f"team/{run_tag}/{role}"
         sessions[role] = client.create_session(title)
+    return sessions
+
+
+def load_sessions(conn) -> dict[str, str]:
+    """Role -> session id already stored in the state DB (for resuming)."""
+    sessions = {}
+    for role in ROLES:
+        session_id = team_db.get_session_id(conn, role)
+        if not session_id:
+            raise SystemExit(f"в состоянии нет сессии для {role}; продолжать нечего")
+        sessions[role] = session_id
     return sessions
 
 
@@ -1089,39 +1260,94 @@ def cmd_run(args) -> int:
         ensure_plugin_deps()
         if not (PROJECT / "opencode.json").exists():
             raise SystemExit("нет opencode.json рядом с team.py")
-        server = ensure_server(args.port)
-        run_tag = time.strftime("%Y%m%d-%H%M%S")
-        reset_run_state()
-        conn = team_db.connect(DB_PATH)
-        try:
-            team_db.set_meta(conn, "run_tag", run_tag)
-            team_db.set_meta(conn, "task", args.task.strip())
-        finally:
-            conn.close()
+        resume = args.resume is not None
+        if resume:
+            run_tag_arg = args.resume or ""
+            if run_tag_arg:
+                run_dir = RUNS_DIR / run_tag_arg
+                if not (run_dir / "state.db").exists():
+                    raise SystemExit(f"прогон {run_tag_arg} не найден в run/runs/")
+            else:
+                run_dir = team_db.current_run_dir()
+                if not (run_dir / "state.db").exists():
+                    raise SystemExit("нет сохранённого прогона для продолжения")
+            server = ensure_server(args.port)
+            conn = team_db.connect(run_dir / "state.db")
+            try:
+                run_tag = team_db.get_meta(conn, "run_tag", "") or run_dir.name
+                task = team_db.get_meta(conn, "task", "") or (args.task or "")
+                try:
+                    sessions = load_sessions(conn)
+                except SystemExit:
+                    sessions = dict(load_run_manifest(run_dir).get("sessions") or {})
+            finally:
+                conn.close()
+            if not task.strip():
+                raise SystemExit("в состоянии нет текста задачи — нечего продолжать")
+            if len(sessions) < len(ROLES):
+                raise SystemExit("в состоянии нет привязки сессий — продолжать нечего")
+        else:
+            if not args.task or not args.task.strip():
+                raise SystemExit("нужен текст задачи (или --resume)")
+            blocker = new_run_blocker(args.fresh)
+            if blocker:
+                raise SystemExit(blocker)
+            migrated = migrate_legacy_run()
+            if migrated:
+                print(f"Предыдущий прогон перенесён в run/runs/{migrated}/")
+            ok, message = restart_server_keep_auth(verbose=True)
+            if not ok:
+                raise SystemExit(message)
+            server = load_server()
+            if not server:
+                raise SystemExit("сервер перезапущен, но server.json не найден")
+            run_tag = args.run_tag or time.strftime("%Y%m%d-%H%M%S")
+            task = args.task.strip()
+            run_dir = new_run_dir(run_tag)
+            conn = team_db.connect(run_dir / "state.db")
+            try:
+                team_db.set_meta(conn, "run_tag", run_tag)
+                team_db.set_meta(conn, "task", task)
+            finally:
+                conn.close()
 
-        client = OpenCode(server["url"], server["password"], timeout=args.timeout)
-        sessions = create_sessions(client, run_tag)
-        conn = team_db.connect(DB_PATH)
-        try:
-            for role, session_id in sessions.items():
-                team_db.set_session(conn, role, session_id)
-        finally:
-            conn.close()
+            client = OpenCode(server["url"], server["password"], timeout=args.timeout)
+            sessions = create_sessions(client, run_tag)
+            conn = team_db.connect(run_dir / "state.db")
+            try:
+                for role, session_id in sessions.items():
+                    team_db.set_session(conn, role, session_id)
+            finally:
+                conn.close()
 
+        write_pointer(run_tag, run_dir)
+        write_run_manifest(run_dir, run_tag, task, sessions)
         write_attach_helpers(server, sessions)
-        print("\nСессии созданы. Наблюдение в отдельных терминалах:")
+        if resume:
+            print(f"\nПродолжаю прогон {run_tag}: {short(task, 120)}")
+        else:
+            print("\nСессии созданы. Наблюдение в отдельных терминалах:")
         for role in ROLES:
             print(
                 f"  {role:<11} opencode attach {server['url']} -s {sessions[role]} "
                 f"-p {server['password']} --dir {PROJECT}"
             )
-        print("\nКратко: bash run/attach.sh <controller|researcher|developer|tester>")
-        print("События: run/events.log · чаты: run/chat/<role>.md · состояние: team.py status\n")
+        print(f"\nКаталог прогона: {run_dir}")
+        print("Кратко: bash run/attach.sh <controller|researcher|developer|tester>")
+        print("Состояние: team.py status · список прогонов: team.py runs\n")
 
-        orch = Orchestrator(args.task, server, sessions, args.timeout, debug=args.debug)
+        orch = Orchestrator(
+            task,
+            server,
+            sessions,
+            args.timeout,
+            debug=args.debug,
+            db_path=run_dir / "state.db",
+            run_dir=run_dir,
+        )
         start_stdin_reader(orch)
         try:
-            orch.run()
+            orch.run(resume=resume)
         except KeyboardInterrupt:
             print("\nОстановлено пользователем. Сервер оставлен запущенным (team.py stop).")
             return 130
@@ -1131,6 +1357,7 @@ def cmd_run(args) -> int:
         except Exception:
             print("\nОШИБКА оркестратора:", file=sys.stderr)
             traceback.print_exc()
+            mark_run_failed(run_dir / "state.db")
             print("Сессии и журнал сохранены в run/.", file=sys.stderr)
             return 1
         return 0
@@ -1142,7 +1369,7 @@ def cmd_run(args) -> int:
 
 
 def cmd_status(args) -> int:
-    path = Path(args.db) if args.db else DB_PATH
+    path = Path(args.db) if args.db else team_db.db_path()
     if not path.exists():
         print("Состояния пока нет: запустите team.py run")
         return 1
@@ -1180,7 +1407,7 @@ def format_event(event) -> str:
 
 
 def cmd_events(args) -> int:
-    path = Path(args.db) if args.db else DB_PATH
+    path = Path(args.db) if args.db else team_db.db_path()
     conn = team_db.connect(path)
     try:
         for event in team_db.recent_events(conn, args.n):
@@ -1191,7 +1418,7 @@ def cmd_events(args) -> int:
 
 
 def cmd_watch(args) -> int:
-    path = Path(args.db) if args.db else DB_PATH
+    path = Path(args.db) if args.db else team_db.db_path()
     if not path.exists():
         print("Состояния пока нет: запустите team.py run", file=sys.stderr)
         return 1
@@ -1226,7 +1453,7 @@ def cmd_watch(args) -> int:
 
 
 def cmd_answer(args) -> int:
-    path = Path(args.db) if args.db else DB_PATH
+    path = Path(args.db) if args.db else team_db.db_path()
     if not path.exists():
         print("Состояния пока нет: запустите team.py run", file=sys.stderr)
         return 1
@@ -1262,6 +1489,38 @@ def cmd_cancel(args) -> int:
     return 0
 
 
+def cmd_runs(args) -> int:
+    entries = []
+    if RUNS_DIR.exists():
+        entries.extend(
+            sorted((d for d in RUNS_DIR.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
+        )
+    if DB_PATH.exists():
+        entries.append(RUN_DIR)
+    shown = 0
+    for d in entries:
+        db = d / "state.db"
+        if not db.exists():
+            continue
+        try:
+            conn = team_db.connect(db)
+            try:
+                tag = team_db.get_meta(conn, "run_tag", "") or d.name
+                status = team_db.get_meta(conn, "run_status", "?") or "?"
+                task = team_db.get_meta(conn, "task", "") or ""
+                events = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            continue
+        marker = "  (legacy)" if d == RUN_DIR else ""
+        print(f"{tag:<20} {status:<10} events={events:<4} {short(task, 70)}{marker}")
+        shown += 1
+    if not shown:
+        print("Прогонов пока нет: run/runs/")
+    return 0
+
+
 def cmd_stop(args) -> int:
     server = load_server()
     if not server:
@@ -1286,11 +1545,30 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="team.py", description="AutomateML multi-agent orchestrator")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run_p = sub.add_parser("run", help="start a run")
-    run_p.add_argument("task")
+    run_p = sub.add_parser("run", help="start a new run, or continue a saved one with --resume")
+    run_p.add_argument("task", nargs="?", help="task text (required for a new run)")
     run_p.add_argument("--port", type=int, default=4096)
     run_p.add_argument("--timeout", type=int, default=1800, help="turn timeout in seconds")
     run_p.add_argument("--debug", action="store_true")
+    run_p.add_argument(
+        "--fresh",
+        action="store_true",
+        help="start a new run even if a saved run exists (nothing is deleted)",
+    )
+    run_p.add_argument(
+        "--run-tag",
+        dest="run_tag",
+        default=None,
+        help="explicit tag for a new run (used by the bot/launcher)",
+    )
+    run_p.add_argument(
+        "--resume",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="RUN_TAG",
+        help="continue the saved run (optionally a specific run tag)",
+    )
     run_p.set_defaults(func=cmd_run)
 
     status_p = sub.add_parser("status", help="state overview")
@@ -1317,6 +1595,9 @@ def main(argv: list[str]) -> int:
 
     stop_p = sub.add_parser("stop", help="stop the opencode server started by a run")
     stop_p.set_defaults(func=cmd_stop)
+
+    runs_p = sub.add_parser("runs", help="list saved runs (tag, status, task)")
+    runs_p.set_defaults(func=cmd_runs)
 
     args = parser.parse_args(argv)
     return args.func(args)

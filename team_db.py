@@ -72,12 +72,48 @@ CREATE TABLE IF NOT EXISTS sources (
 """
 
 
+PROJECT = Path(__file__).resolve().parent
+RUN_ROOT = PROJECT / "run"
+POINTER_FILE = RUN_ROOT / "current.json"
+
+
+def _read_pointer() -> Path | None:
+    """Resolve the active run directory from run/current.json, if valid."""
+    try:
+        data = json.loads(POINTER_FILE.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    rel = data.get("dir") if isinstance(data, dict) else None
+    if not rel:
+        return None
+    candidate = RUN_ROOT / rel
+    return candidate if (candidate / "state.db").exists() else None
+
+
+def current_run_dir() -> Path:
+    """Directory holding the active run's artifacts.
+
+    Resolution order: TEAM_RUN_DIR env (tests) -> run/current.json pointer ->
+    legacy run/ (when it still has a state.db) -> run/ (no run yet).
+    """
+    env = os.environ.get("TEAM_RUN_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    pointer = _read_pointer()
+    if pointer is not None:
+        return pointer
+    return RUN_ROOT
+
+
 def db_path() -> Path:
-    """Resolve the state database path (TEAM_DB env wins, else ./run/state.db)."""
+    """Resolve the state database path.
+
+    TEAM_DB env wins (tests); otherwise the active run's directory is used.
+    """
     env = os.environ.get("TEAM_DB")
     if env:
         return Path(env).expanduser().resolve()
-    return (Path(__file__).resolve().parent / "run" / "state.db")
+    return current_run_dir() / "state.db"
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:

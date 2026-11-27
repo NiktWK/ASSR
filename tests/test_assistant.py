@@ -20,9 +20,8 @@ class AssistantTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="assistant-"))
         self.db = self.tmp / "state.db"
-        self.orig = (assistant_agent.RUN_DIR, assistant_agent.DB_PATH, assistant_agent.SECRETARY_FILE)
+        self.orig = (assistant_agent.RUN_DIR, assistant_agent.SECRETARY_FILE)
         assistant_agent.RUN_DIR = self.tmp
-        assistant_agent.DB_PATH = self.db
         assistant_agent.SECRETARY_FILE = self.tmp / "secretary.json"
         assistant_agent.SECRETARY_FILE.write_text(
             json.dumps({"session_id": "ses_secretary"}), "utf-8"
@@ -42,7 +41,6 @@ class AssistantTest(unittest.TestCase):
     def tearDown(self) -> None:
         (
             assistant_agent.RUN_DIR,
-            assistant_agent.DB_PATH,
             assistant_agent.SECRETARY_FILE,
         ) = self.orig
         if self.old_env is None:
